@@ -43,7 +43,7 @@ def interaction_for(channel):
         created_at=datetime.now(timezone.utc),
         app_permissions=discord.Permissions(view_channel=True, read_message_history=True, send_messages=True),
         permissions=discord.Permissions(read_message_history=True),
-        response=SimpleNamespace(defer=AsyncMock()),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
         edit_original_response=AsyncMock(),
     )
 
@@ -88,6 +88,11 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         for guild_id in (None, 123):
             with self.subTest(guild_id=guild_id):
                 bot = RaniBot(Settings("unused", "unused", guild_id=guild_id), FakeLLM({}))
+                self.assertEqual({c.name for c in bot.tree.get_commands()}, {"agents", "ask", "status", "help"})
+                self.assertTrue(all(c.guild_only for c in bot.tree.get_commands()))
+                ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
+                self.assertEqual([c["value"] for c in ask_options[0]["choices"]], ["Mira", "Hex", "Moss"])
+                self.assertEqual((ask_options[1]["min_length"], ask_options[1]["max_length"]), (1, 1500))
                 command = bot.tree.get_command("agents")
                 self.assertTrue(command.guild_only)
                 self.assertEqual(command.parameters, [])
@@ -99,7 +104,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 if guild_id:
                     guild = bot.tree.sync.call_args.kwargs["guild"]
                     self.assertEqual(guild.id, guild_id)
-                    self.assertIsNotNone(bot.tree.get_command("agents", guild=guild))
+                    self.assertEqual({c.name for c in bot.tree.get_commands(guild=guild)}, {"agents", "ask", "status", "help"})
                 else:
                     bot.tree.sync.assert_awaited_once_with()
                 await bot.close()
@@ -210,6 +215,144 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         with patch("agents.AGENT_TIMEOUT_SECONDS", 0.02), self.assertLogs("agents", level="WARNING"):
             results = await consult_agents(SimpleNamespace(generate=generate), "[]")
         self.assertEqual([r.agent.name for r in results if r.failed], ["Hex"])
+
+
+class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.llm = FakeLLM({"Hex": "@everyone Compare retention after a week."})
+        self.bot = RaniBot(Settings("private-token", "private-key", llm_model="test-model"), self.llm)
+        self.channel = channel_with([message("private channel history")])
+        self.interaction = interaction_for(self.channel)
+
+    async def asyncTearDown(self):
+        await self.bot.close()
+
+    async def test_ask_sends_only_question_to_selected_agent_and_posts_safely(self):
+        self.interaction.app_permissions.read_message_history = False
+        self.interaction.permissions.read_message_history = False
+        self.llm.generate = AsyncMock(wraps=self.llm.generate)
+        await self.bot.run_ask(self.interaction, "Hex", "  How should I test retention?  ")
+        self.assertEqual(self.llm.calls, [("Hex", '{"question": "How should I test retention?"}')])
+        prompt = self.llm.generate.call_args.args[0]
+        self.assertIn("address you directly", prompt)
+        self.assertNotIn("permission to consider joining", prompt)
+        self.channel.history.assert_not_called()
+        self.channel.send.assert_awaited_once()
+        post = self.channel.send.call_args
+        self.assertTrue(post.args[0].startswith("**Hex:** "))
+        self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
+        self.assertTrue(post.kwargs["suppress_embeds"])
+        self.interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_ask_rejects_bad_input_without_ai_or_history(self):
+        for agent, question in [("Hex", "   "), ("Hex", "x" * 1501), ("Unknown", "Hi")]:
+            with self.subTest(agent=agent, length=len(question)):
+                await self.bot.run_ask(self.interaction, agent, question)
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.assert_not_called()
+        self.channel.send.assert_not_awaited()
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_ask_checks_channel_and_send_permissions_before_ai(self):
+        for permission in ["view_channel", "send_messages"]:
+            with self.subTest(permission=permission):
+                interaction = interaction_for(self.channel)
+                setattr(interaction.app_permissions, permission, False)
+                await self.bot.run_ask(interaction, "Hex", "Question?")
+        interaction = interaction_for(self.channel)
+        interaction.guild = None
+        await self.bot.run_ask(interaction, "Hex", "Question?")
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.assert_not_called()
+        self.channel.send.assert_not_awaited()
+
+    async def test_ask_thread_uses_thread_send_permission(self):
+        channel = MagicMock(spec=discord.Thread)
+        channel.id = 51
+        channel.send = AsyncMock()
+        interaction = interaction_for(channel)
+        interaction.app_permissions.send_messages = False
+        await self.bot.run_ask(interaction, "Hex", "Question?")
+        self.assertEqual(self.llm.calls, [])
+        interaction.app_permissions.send_messages_in_threads = True
+        await self.bot.run_ask(interaction, "Hex", "Question?")
+        channel.send.assert_awaited_once()
+        channel.history.assert_not_called()
+        self.assertEqual(len(self.llm.calls), 1)
+
+    async def test_ask_failure_is_private_and_releases_channel(self):
+        self.llm.replies["Hex"] = RuntimeError("secret-sensitive-body")
+        with self.assertLogs("agents", level="WARNING") as logs:
+            await self.bot.run_ask(self.interaction, "Hex", "Question?")
+        self.channel.send.assert_not_awaited()
+        status = self.interaction.edit_original_response.call_args.kwargs["content"]
+        self.assertIn("Could not get an answer", status)
+        self.assertNotIn("secret-sensitive-body", status + str(logs.output))
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_ask_timeout_and_silence_never_post_public_fallbacks(self):
+        async def hanging(*args):
+            await asyncio.Event().wait()
+        self.llm.generate = hanging
+        with patch("agents.AGENT_TIMEOUT_SECONDS", 0.02), self.assertLogs("agents", level="WARNING"):
+            await self.bot.run_ask(self.interaction, "Hex", "Question?")
+        self.assertFalse(self.bot.active_channels)
+        self.llm.generate = AsyncMock(return_value="SILENT")
+        await self.bot.run_ask(self.interaction, "Hex", "Question?")
+        self.channel.send.assert_not_awaited()
+        self.assertIn("did not return an answer", self.interaction.edit_original_response.call_args.kwargs["content"])
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_ask_discord_failure_releases_channel_without_retrying_ai(self):
+        self.channel.send.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Denied")
+        with self.assertLogs("bot", level="WARNING"):
+            await self.bot.run_ask(self.interaction, "Hex", "Question?")
+        self.assertFalse(self.bot.active_channels)
+        self.assertEqual(len(self.llm.calls), 1)
+        self.assertIn("permissions", self.interaction.edit_original_response.call_args.kwargs["content"])
+
+    async def test_ask_and_agents_share_channel_guard(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def generate(*args):
+            started.set()
+            await release.wait()
+            return "SILENT"
+        self.llm.generate = AsyncMock(side_effect=generate)
+        first = asyncio.create_task(self.bot.run_ask(self.interaction, "Hex", "Question?"))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            second = interaction_for(self.channel)
+            await self.bot.run_ask(second, "Mira", "Another question?")
+            self.assertIn("already running", second.edit_original_response.call_args.kwargs["content"])
+            await self.bot.run_agents(second)
+            self.assertIn("already considering", second.edit_original_response.call_args.kwargs["content"])
+            self.channel.history.assert_not_called()
+            self.assertEqual(self.llm.generate.await_count, 1)
+        finally:
+            release.set()
+            await first
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_status_and_help_are_private_without_ai_or_history(self):
+        self.bot.started_at = 100
+        with patch("bot.time.monotonic", return_value=90161):
+            await self.bot.run_status(self.interaction)
+        status = self.interaction.response.send_message.call_args.args[0]
+        self.assertIn("1d 1h 1m 1s", status)
+        self.assertIn("test-model", status)
+        self.assertIn("not measured yet", status)
+        self.assertIn("does not check API billing", status)
+        await self.bot.run_help(self.interaction)
+        for call in self.interaction.response.send_message.call_args_list:
+            self.assertTrue(call.kwargs["ephemeral"])
+            self.assertEqual(call.kwargs["allowed_mentions"].to_dict()["parse"], [])
+            self.assertNotIn("private-token", call.args[0])
+            self.assertNotIn("private-key", call.args[0])
+            self.assertLess(len(call.args[0]), 2000)
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.assert_not_called()
+        self.channel.send.assert_not_awaited()
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):

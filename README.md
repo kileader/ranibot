@@ -11,9 +11,34 @@ Normal conversation → `/agents` → three independent decisions → zero to th
 
 The bot fetches the latest **30 channel messages before the command was invoked**, excludes bots, webhooks, system messages, and empty text, then gives each agent the same chronological human transcript. This can mean fewer than 30 human messages. It includes usernames, display names, and text, with each message limited to 1,500 characters. It doesn't download attachments or open links.
 
-Each agent makes one LLM call that returns either a short contribution or `SILENT`. All three calls run concurrently; contributions are posted in Mira/Hex/Moss order. Silence produces no public message. Status and errors are private to whoever ran the command. The command permits only one active run per channel, within this bot process.
+Each agent makes one LLM call that returns either a short contribution or `SILENT`. All three calls run concurrently; contributions are posted in Mira/Hex/Moss order. Silence produces no public message. Status and errors are private to whoever ran the command. AI commands permit only one active run per channel, within this bot process.
 
 There is no database, persistent memory, background participation, tool execution, browsing, Moltbook integration, webhook identity, or multi-bot setup. No message events are subscribed to and no Discord message cache is kept. History is fetched only inside `/agents`. Earlier bot replies are excluded too: v0 does not conduct agent-to-agent debates or remember its previous contributions. Repeated commands on unchanged chat may produce similar replies.
+
+## Commands
+
+| Command | What it does | AI requests | Public output |
+| --- | --- | --- | --- |
+| `/agents` | Reads recent human chat; all three agents independently decide whether to contribute | 3 when there is readable human text | Zero to three labeled replies |
+| `/ask agent question` | Asks Mira, Hex, or Moss directly, using only your question | 1 for a valid, permitted request | One short labeled answer if successful |
+| `/status` | Shows process uptime, Discord heartbeat latency, and configured model | 0 | None; private response |
+| `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
+
+For example, use `/ask`, select **Hex**, and enter "How could I measure whether my
+study schedule improves retention?" The question is limited to 1,500 characters;
+the answer is limited to 800 characters. Unlike `/agents`, direct questions use an
+answering prompt rather than asking whether to participate. If the provider fails
+or returns silence, you get a private notice instead of a public fallback.
+
+`/ask` never reads channel history or adds usernames to the provider request. Its
+answer is public and may repeat parts of the question, so do not enter secrets.
+`/ask` and `/agents` share a per-channel busy guard to prevent overlapping AI runs.
+Both suppress mentions and link previews. No command gives agents tools or access
+to your computer. `/status` reports configuration; it does not test OpenAI access,
+billing, or available credit. Uptime resets when Railway restarts the process.
+
+All four commands follow `DISCORD_GUILD_ID`: a configured test server receives the
+commands immediately; leaving it blank registers them globally on startup.
 
 ## Windows PowerShell setup
 
@@ -63,9 +88,9 @@ LLM_MODEL=gpt-4.1-mini
 DISCORD_GUILD_ID=your_numeric_test_server_id
 ```
 
-Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty invocation sends three requests, even if every agent chooses silence. No automatic retries are configured.
+Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/ask` sends one request to its selected agent. No automatic retries are configured.
 
-`DISCORD_GUILD_ID` is optional but recommended: when set, `/agents` is synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
+`DISCORD_GUILD_ID` is optional but recommended: when set, all four commands are synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
 
 ### 5. Install dependencies
 
@@ -194,13 +219,13 @@ A Railway-hosted process cannot directly read your home PC's temperatures or usa
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenAI SDK call. They check context boundaries and ordering, silent decisions, labeled posting, mention suppression, empty channels, overlapping invocations, permission failures, partial API failure, timeouts, and the provider request contract. They do not contact Discord/OpenAI or require `.env`. Real credentials and a test server are still needed to verify live permissions, command visibility, model access, and response quality.
+Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenAI SDK call. They check context boundaries and ordering, silent decisions, labeled posting, mention suppression, empty channels, overlapping invocations, permission failures, partial API failure, timeouts, direct-question isolation, utility commands without AI calls, and the provider request contract. They do not contact Discord/OpenAI or require `.env`. Real credentials and a test server are still needed to verify live permissions, command visibility, model access, and response quality.
 
 ## Small code map
 
 | File | Responsibility |
 | --- | --- |
-| `bot.py` | Discord connection, `/agents`, recent human context, labeled posting |
+| `bot.py` | Discord connection, four slash commands, recent human context, labeled posting |
 | `agents.py` | Agent dataclass, personalities, silence parsing, independent calls |
 | `llm.py` | Async provider interface and OpenAI adapter |
 | `config.py` | Validated `.env` configuration |
@@ -210,9 +235,9 @@ To change personalities, edit `AGENTS` in `agents.py`. To add another provider l
 
 ## Privacy and limitations
 
-Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
+Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. `/ask` sends only its question in one request; `/status` and `/help` send nothing to OpenAI. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
 
-This is a toy, not a moderation system or a secure prompt-injection defense. Conversation content is separated from system instructions, and agents have no tools or secrets in their prompts, but model output can still be mistaken or manipulated. Anyone who can use the command can incur API costs. Restrict installation and command access to trusted testers; there is no persistent rate limiter. This v0 intentionally stops at the requested workflow.
+This is a toy, not a moderation system or a secure prompt-injection defense. Conversation content is separated from system instructions, and agents have no tools or secrets in their prompts, but model output can still be mistaken or manipulated. Anyone who can use the command can incur API costs. Restrict installation and command access to trusted testers; there is no persistent rate limiter. These commands intentionally avoid persistent memory, autonomous behavior, and system tools.
 
 ## Troubleshooting
 
