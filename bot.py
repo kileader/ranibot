@@ -61,6 +61,7 @@ class RaniBot(discord.Client):
             ("agents", "Let Mira, Hex, and Moss consider joining the conversation.", self.run_agents),
             ("ask", "Ask one agent a question; only that question goes to AI. Reply is public.", self.run_ask),
             ("status", "Show uptime and configured model without making an AI request.", self.run_status),
+            ("chesslab", "Share the Chess Lab app link and introduction; no AI request.", self.run_chesslab),
             ("help", "Explain Ranibot's commands and what gets sent to AI.", self.run_help),
         ):
             command = app_commands.Command(name=name, description=description, callback=callback)
@@ -73,10 +74,10 @@ class RaniBot(discord.Client):
             guild = discord.Object(id=self.settings.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info("Synced /agents, /ask, /status, /help to test server %s", guild.id)
+            logger.info("Synced /agents, /ask, /status, /chesslab, /help to test server %s", guild.id)
         else:
             await self.tree.sync()
-            logger.info("Synced /agents, /ask, /status, /help globally")
+            logger.info("Synced /agents, /ask, /status, /chesslab, /help globally")
 
     async def on_ready(self) -> None:
         logger.info("Ranibot connected as bot ID %s", self.user.id)
@@ -205,12 +206,22 @@ class RaniBot(discord.Client):
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 
+    async def run_chesslab(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            "**Chess Lab** — Explore your opening results and find positions to study.\n"
+            "Import games from Lichess, Chess.com, or PGN. Sign in with Google; your library stays private.\n"
+            "**[Open Chess Lab](https://chess-lab-zeta.vercel.app)**\n\n"
+            "This command only shares the link. It doesn't access your games or make an AI request.",
+            ephemeral=False, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
+        )
+
     async def run_help(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "**Ranibot commands**\n"
             "**/agents** — Reads the latest 30 channel messages, filters for human text, and asks Mira, Hex, and Moss independently whether to join in. Any of them may stay silent.\n"
             "**/ask agent question** — Sends only your question to one chosen agent and posts a short, labeled answer publicly. No channel history is read.\n"
             "**/status** — Shows uptime and the configured model; makes no AI request.\n"
+            "**/chesslab** — Publicly shares the Chess Lab link and introduction; no game access or AI request.\n"
             "**/help** — Shows this private guide; makes no AI request.\n\n"
             "**Privacy and cost:** /agents sends recent usernames and text to OpenAI in three requests. /ask sends your question in one request. Both use paid API usage. Avoid sharing secrets and get participants' agreement before using /agents.\n"
             "The bot has no persistent memory or access to your computer, does not browse links, and reads chat only when /agents is invoked. AI replies can be wrong.",

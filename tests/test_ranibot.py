@@ -88,7 +88,8 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         for guild_id in (None, 123):
             with self.subTest(guild_id=guild_id):
                 bot = RaniBot(Settings("unused", "unused", guild_id=guild_id), FakeLLM({}))
-                self.assertEqual({c.name for c in bot.tree.get_commands()}, {"agents", "ask", "status", "help"})
+                self.assertEqual({c.name for c in bot.tree.get_commands()}, {"agents", "ask", "status", "chesslab", "help"})
+                self.assertEqual(bot.tree.get_command("chesslab").parameters, [])
                 self.assertTrue(all(c.guild_only for c in bot.tree.get_commands()))
                 ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
                 self.assertEqual([c["value"] for c in ask_options[0]["choices"]], ["Mira", "Hex", "Moss"])
@@ -104,7 +105,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 if guild_id:
                     guild = bot.tree.sync.call_args.kwargs["guild"]
                     self.assertEqual(guild.id, guild_id)
-                    self.assertEqual({c.name for c in bot.tree.get_commands(guild=guild)}, {"agents", "ask", "status", "help"})
+                    self.assertEqual({c.name for c in bot.tree.get_commands(guild=guild)}, {"agents", "ask", "status", "chesslab", "help"})
                 else:
                     bot.tree.sync.assert_awaited_once_with()
                 await bot.close()
@@ -334,6 +335,29 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertFalse(self.bot.active_channels)
 
+    async def test_chesslab_shares_public_link_without_ai_history_or_account_access(self):
+        self.interaction.app_permissions.read_message_history = False
+        self.interaction.permissions.read_message_history = False
+        self.bot.active_channels.add(self.channel.id)
+        await self.bot.run_chesslab(self.interaction)
+        self.interaction.response.send_message.assert_awaited_once()
+        post = self.interaction.response.send_message.call_args
+        self.assertFalse(post.kwargs["ephemeral"])
+        self.assertTrue(post.kwargs["suppress_embeds"])
+        self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
+        self.assertIn("https://chess-lab-zeta.vercel.app", post.args[0])
+        self.assertIn("Sign in with Google", post.args[0])
+        self.assertIn("library stays private", post.args[0])
+        self.assertIn("doesn't access your games", post.args[0])
+        self.assertNotIn("private-token", post.args[0])
+        self.assertNotIn("private-key", post.args[0])
+        self.assertLess(len(post.args[0]), 2000)
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.assert_not_called()
+        self.channel.send.assert_not_awaited()
+        self.interaction.response.defer.assert_not_awaited()
+        self.assertEqual(self.bot.active_channels, {self.channel.id})
+
     async def test_status_and_help_are_private_without_ai_or_history(self):
         self.bot.started_at = 100
         with patch("bot.time.monotonic", return_value=90161):
@@ -344,6 +368,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not measured yet", status)
         self.assertIn("does not check API billing", status)
         await self.bot.run_help(self.interaction)
+        self.assertIn("**/chesslab**", self.interaction.response.send_message.call_args.args[0])
         for call in self.interaction.response.send_message.call_args_list:
             self.assertTrue(call.kwargs["ephemeral"])
             self.assertEqual(call.kwargs["allowed_mentions"].to_dict()["parse"], [])

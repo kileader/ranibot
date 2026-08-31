@@ -22,6 +22,7 @@ There is no database, persistent memory, background participation, tool executio
 | `/agents` | Reads recent human chat; all three agents independently decide whether to contribute | 3 when there is readable human text | Zero to three labeled replies |
 | `/ask agent question` | Asks Mira, Hex, or Moss directly, using only your question | 1 for a valid, permitted request | One short labeled answer if successful |
 | `/status` | Shows process uptime, Discord heartbeat latency, and configured model | 0 | None; private response |
+| `/chesslab` | Shares the Chess Lab app link and a short introduction | 0 | One message with the app link |
 | `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
 
 For example, use `/ask`, select **Hex**, and enter "How could I measure whether my
@@ -37,7 +38,14 @@ Both suppress mentions and link previews. No command gives agents tools or acces
 to your computer. `/status` reports configuration; it does not test OpenAI access,
 billing, or available credit. Uptime resets when Railway restarts the process.
 
-All four commands follow `DISCORD_GUILD_ID`: a configured test server receives the
+`/chesslab` posts a fixed introduction and a link to
+[Chess Lab](https://chess-lab-zeta.vercel.app). It does not read channel history,
+call AI, fetch the website, link accounts, or access anyone's games. The response
+is public, with mentions and link previews suppressed. Chess Lab sign-in happens
+on the website, and game libraries remain private. No new configuration or
+permissions are required.
+
+All five commands follow `DISCORD_GUILD_ID`: a configured test server receives the
 commands immediately; leaving it blank registers them globally on startup.
 
 ## Windows PowerShell setup
@@ -90,7 +98,7 @@ DISCORD_GUILD_ID=your_numeric_test_server_id
 
 Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/ask` sends one request to its selected agent. No automatic retries are configured.
 
-`DISCORD_GUILD_ID` is optional but recommended: when set, all four commands are synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
+`DISCORD_GUILD_ID` is optional but recommended: when set, all five commands are synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
 
 ### 5. Install dependencies
 
@@ -225,7 +233,7 @@ Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenA
 
 | File | Responsibility |
 | --- | --- |
-| `bot.py` | Discord connection, four slash commands, recent human context, labeled posting |
+| `bot.py` | Discord connection, five slash commands, recent human context, labeled posting |
 | `agents.py` | Agent dataclass, personalities, silence parsing, independent calls |
 | `llm.py` | Async provider interface and OpenAI adapter |
 | `config.py` | Validated `.env` configuration |
