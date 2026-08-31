@@ -1,0 +1,10 @@
+# Upload only the files required to build and run the bot.
+*
+!Dockerfile
+!.dockerignore
+!.railwayignore
+!requirements.txt
+!bot.py
+!agents.py
+!llm.py
+!config.py
