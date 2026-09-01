@@ -14,18 +14,22 @@ class LLM(Protocol):
 
 
 class OpenAILLM:
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, reasoning_effort: str | None = None):
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.client = AsyncOpenAI(api_key=api_key, timeout=30.0, max_retries=0)
 
     async def generate(self, system_prompt: str, context: str) -> str:
-        response = await self.client.responses.create(
+        request = dict(
             model=self.model,
             instructions=system_prompt,
             input=context,
             max_output_tokens=400,
             store=False,
         )
+        if self.reasoning_effort is not None:
+            request["reasoning"] = {"effort": self.reasoning_effort}
+        response = await self.client.responses.create(**request)
         if response.status != "completed":
             # Don't post a partial answer (including a truncated SILENT decision).
             raise RuntimeError("LLM response did not complete.")
@@ -39,5 +43,7 @@ class OpenAILLM:
 
 def create_llm(settings: Settings) -> LLM:
     if settings.llm_provider == "openai":
-        return OpenAILLM(settings.llm_api_key, settings.llm_model)
+        return OpenAILLM(
+            settings.llm_api_key, settings.llm_model, settings.llm_reasoning_effort
+        )
     raise ValueError("Unsupported LLM provider.")

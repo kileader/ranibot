@@ -732,6 +732,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(request["store"])
             self.assertNotIn("tools", request)
             self.assertNotIn("previous_response_id", request)
+            self.assertNotIn("reasoning", request)
             sdk.return_value.responses.create.return_value.status = "incomplete"
             with self.assertRaises(RuntimeError):
                 await llm.generate("system", "context")
@@ -740,6 +741,19 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 await llm.generate("system", "context")
             await llm.close()
             sdk.return_value.close.assert_awaited_once()
+
+    async def test_reasoning_effort_is_explicit_when_configured(self):
+        with patch("llm.AsyncOpenAI") as sdk:
+            sdk.return_value.responses.create = AsyncMock(
+                return_value=SimpleNamespace(status="completed", output_text="SILENT")
+            )
+            sdk.return_value.close = AsyncMock()
+            llm = OpenAILLM("test-key", "gpt-5.6-luna", "none")
+            await llm.generate("system", "context")
+            request = sdk.return_value.responses.create.call_args.kwargs
+            self.assertEqual(request["reasoning"], {"effort": "none"})
+            self.assertEqual(request["max_output_tokens"], 400)
+            await llm.close()
 
 
 class ConfigurationAndOutputTests(unittest.TestCase):
@@ -767,12 +781,21 @@ class ConfigurationAndOutputTests(unittest.TestCase):
             self.assertNotIn("private-token", repr(settings))
             self.assertNotIn("private-key", repr(settings))
             self.assertNotIn("private-database", repr(settings))
+            self.assertEqual(settings.llm_model, "gpt-5.6-luna")
+            self.assertEqual(settings.llm_reasoning_effort, "none")
+            os.environ["LLM_MODEL"] = "gpt-4.1-mini"
+            self.assertIsNone(Settings.from_env().llm_reasoning_effort)
+            os.environ["LLM_MODEL"] = "gpt-5.6-luna"
             os.environ["DISCORD_GUILD_ID"] = "bad-id"
             with self.assertRaisesRegex(ValueError, "DISCORD_GUILD_ID"):
                 Settings.from_env()
             os.environ["DISCORD_GUILD_ID"] = ""
             os.environ["LLM_PROVIDER"] = "unsupported"
             with self.assertRaisesRegex(ValueError, "LLM_PROVIDER"):
+                Settings.from_env()
+            os.environ["LLM_PROVIDER"] = "openai"
+            os.environ["LLM_REASONING_EFFORT"] = "impossible"
+            with self.assertRaisesRegex(ValueError, "LLM_REASONING_EFFORT"):
                 Settings.from_env()
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "DISCORD_BOT_TOKEN"):

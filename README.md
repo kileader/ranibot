@@ -105,7 +105,7 @@ commands immediately; leaving it blank registers them globally on startup.
 
 ## Windows PowerShell setup
 
-Use Python **3.11 or newer**, a Discord test server you can manage, and an OpenAI API key with access to the configured model. The default is `gpt-4.1-mini`; no paid API calls are needed for the offline tests.
+Use Python **3.11 or newer**, a Discord test server you can manage, and an OpenAI API key with access to the configured model. The default is `gpt-5.6-luna` with reasoning disabled; no paid API calls are needed for the offline tests.
 
 ### 1. Create the Discord application and bot
 
@@ -147,7 +147,8 @@ Fill in:
 DISCORD_BOT_TOKEN=your_real_bot_token
 LLM_API_KEY=your_real_openai_api_key
 LLM_PROVIDER=openai
-LLM_MODEL=gpt-4.1-mini
+LLM_MODEL=gpt-5.6-luna
+LLM_REASONING_EFFORT=none
 DISCORD_GUILD_ID=your_numeric_test_server_id
 DATABASE_URL=your_postgresql_connection_string
 ```
@@ -217,7 +218,8 @@ other services; check your workspace usage and spending controls.
    | `DISCORD_BOT_TOKEN` | Your existing Discord bot token |
    | `LLM_API_KEY` | Your funded OpenAI API key |
    | `LLM_PROVIDER` | `openai` |
-   | `LLM_MODEL` | `gpt-4.1-mini` (or your current model) |
+   | `LLM_MODEL` | `gpt-5.6-luna` |
+   | `LLM_REASONING_EFFORT` | `none` |
    | `DISCORD_GUILD_ID` | Your test server's numeric ID |
    | `DATABASE_URL` | A Railway reference such as `${{Postgres.DATABASE_URL}}` |
 
@@ -304,7 +306,7 @@ Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenA
 | `memory.py` | PostgreSQL schema/store, bounded buffers, and server-memory extraction |
 | `tests/test_ranibot.py` | Offline workflow checks |
 
-To change personalities, edit `AGENTS` in `agents.py`. To add another provider later, implement `generate(system_prompt, context)` and `close()` in `llm.py`, then update its factory and configuration validation. Only `openai` works today; setting a different provider name does not magically add compatibility. The adapter uses the [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text?api-mode=responses). The [default model's documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini) lists supported endpoints; choose a model available to your API project. Reasoning-heavy models may need a larger output budget than this toy's 400-token cap.
+To change personalities, edit `AGENTS` in `agents.py`. To add another provider later, implement `generate(system_prompt, context)` and `close()` in `llm.py`, then update its factory and configuration validation. Only `openai` works today; setting a different provider name does not magically add compatibility. The adapter uses the [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text?api-mode=responses). The [default model's documentation](https://developers.openai.com/api/docs/models/gpt-5.6-luna) lists supported endpoints. Ranibot explicitly uses `reasoning.effort: none` so its 400-token output cap is reserved for the short visible answer; other models may support different reasoning values, and account availability can vary.
 
 ## Privacy and limitations
 
