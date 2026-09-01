@@ -14,6 +14,7 @@ class Settings:
     llm_provider: str = "openai"
     llm_model: str = "gpt-4.1-mini"
     guild_id: int | None = None
+    database_url: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -42,4 +43,5 @@ class Settings:
                 raise ValueError("DISCORD_GUILD_ID must be a positive server ID or blank.") from None
             if not 0 < guild_id < 2**64:
                 raise ValueError("DISCORD_GUILD_ID must be a positive server ID or blank.")
-        return cls(token, api_key, provider, model, guild_id)
+        database_url = os.getenv("DATABASE_URL", "").strip() or None
+        return cls(token, api_key, provider, model, guild_id, database_url)

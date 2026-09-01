@@ -13,19 +13,51 @@ The bot fetches the latest **30 channel messages before the command was invoked*
 
 Each agent makes one LLM call that returns either a short contribution or `SILENT`. All three calls run concurrently; contributions are posted in Mira/Hex/Moss order. Silence produces no public message. Status and errors are private to whoever ran the command. AI slash commands and message actions permit only one active run per channel, within this bot process.
 
-There is no database, persistent memory, background participation, tool execution, browsing, Moltbook integration, webhook identity, or multi-bot setup. No message events are subscribed to and no Discord message cache is kept. History is fetched only inside `/agents` or `/synthesize`. Earlier bot replies are excluded too: v0 does not conduct agent-to-agent debates or remember its previous contributions. Repeated commands on unchanged chat may produce similar replies.
+Ranibot also has optional per-server memory. A member with **Manage Server** must
+explicitly enable it. Once enabled, Ranibot observes future human text in server
+channels it can access, buffers 20 messages, and makes one LLM request to extract up
+to three durable server-level memories. It then deletes that processed message
+batch. Actual replies from Mira, Hex, and Moss are retained in separate agent
+journals. Shared memories and the selected personality's journal are supplied to
+future agent requests in that server. Unprocessed buffered messages expire after
+seven days, and memory never crosses server boundaries.
+
+Memory is deliberately limited: it does not build personal profiles, download
+attachments, open links, execute tools, browse, or respond autonomously. The bot
+keeps no Discord message cache. When memory is paused or unavailable, channel
+history is fetched only inside `/agents` or `/synthesize` and the older memory-free
+behavior remains intact.
 
 ## Commands
 
 | Command | What it does | AI requests | Public output |
 | --- | --- | --- | --- |
 | `/agents` | Reads recent human chat; all three agents independently decide whether to contribute | 3 when there is readable human text | Zero to three labeled replies |
-| `/ask agent question` | Asks Mira, Hex, or Moss directly, using only your question | 1 for a valid, permitted request | One short labeled answer if successful |
+| `/ask agent question` | Asks one agent directly using the question plus enabled server/agent memory; it does not read channel history | 1 for a valid, permitted request | One short labeled answer if successful |
 | `/status` | Shows process uptime, Discord heartbeat latency, and configured model | 0 | None; private response |
 | `/chesslab` | Shares the Chess Lab app link and a short introduction | 0 | One message with the app link |
 | `/synthesize` | Maps recent common ground, tensions, open questions, and a possible next step | 1 when there is readable human text | One compact synthesis if the discussion supports it |
 | `/consent` | Explains what Ranibot reads, sends, stores, and costs | 0 | None; private response |
 | `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
+| `/memory ...` | Inspects, enables, pauses, forgets, or clears per-server memory | 0, except background extraction after each 20 buffered messages | None; private response |
+
+### Persistent memory
+
+`/memory` contains six subcommands:
+
+- `/memory status` shows whether storage is configured and memory is enabled.
+- `/memory enable` starts observation and memory use; **Manage Server** is required.
+- `/memory pause` stops observation and stops applying saved memory without deleting it.
+- `/memory list` privately shows the latest 15 shared and agent memories with IDs.
+- `/memory forget memory_id` deletes one entry; **Manage Server** is required.
+- `/memory clear confirm:True` deletes all stored memories and buffered text for this server; **Manage Server** is required.
+
+Server memory holds up to 40 extracted notes. Each agent journal holds its 20 most
+recent posted contributions. Memories are fallible context, not authoritative facts;
+current conversation should override old or corrected material. If extraction fails,
+the batch remains buffered for a later retry, subject to the seven-day buffer limit.
+To bound prompt size and cost, an agent request receives at most the 12 newest server
+notes and its 8 newest journal entries. Tell members before enabling memory.
 
 ### Message actions
 
@@ -35,12 +67,12 @@ Right-click a text message and choose **Apps** to use one of these actions:
 - **Analyze with Hex**
 - **Connect with Moss**
 
-Each action sends only the selected message text to one personality in one paid AI
+Each action sends the selected message text to one personality in one paid AI
 request, then replies publicly to that message. It does not send the author name,
-surrounding conversation, attachments, embeds, or linked-page contents. Ranibot
-still does not subscribe to passive message events. Empty messages are rejected and
-selected text is capped at 1,500 characters. Mentions and link previews are
-suppressed in the generated reply.
+surrounding conversation, attachments, embeds, or linked-page contents. If memory is
+enabled, saved server context and that personality's journal are included too.
+Empty messages are rejected and selected text is capped at 1,500 characters.
+Mentions and link previews are suppressed in the generated reply.
 
 For example, use `/ask`, select **Hex**, and enter "How could I measure whether my
 study schedule improves retention?" The question is limited to 1,500 characters;
@@ -48,7 +80,7 @@ the answer is limited to 800 characters. Unlike `/agents`, direct questions use 
 answering prompt rather than asking whether to participate. If the provider fails
 or returns silence, you get a private notice instead of a public fallback.
 
-`/ask` never reads channel history or adds usernames to the provider request. Its
+`/ask` never reads channel history or adds the questioner's username to the provider request. Enabled saved memory is included. Its
 answer is public and may repeat parts of the question, so do not enter secrets.
 `/ask` and `/agents` share a per-channel busy guard to prevent overlapping AI runs.
 Both suppress mentions and link previews. No command gives agents tools or access
@@ -68,7 +100,7 @@ is public, with mentions and link previews suppressed. Chess Lab sign-in happens
 on the website, and game libraries remain private. No new configuration or
 permissions are required.
 
-All seven commands follow `DISCORD_GUILD_ID`: a configured test server receives the
+All eight command roots follow `DISCORD_GUILD_ID`: a configured test server receives the
 commands immediately; leaving it blank registers them globally on startup.
 
 ## Windows PowerShell setup
@@ -117,11 +149,15 @@ LLM_API_KEY=your_real_openai_api_key
 LLM_PROVIDER=openai
 LLM_MODEL=gpt-4.1-mini
 DISCORD_GUILD_ID=your_numeric_test_server_id
+DATABASE_URL=your_postgresql_connection_string
 ```
 
 Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/synthesize` sends one request with the same filtered context, and `/ask` sends one request to its selected agent. No automatic retries are configured.
 
-`DISCORD_GUILD_ID` is optional but recommended: when set, all seven commands are synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
+`DISCORD_GUILD_ID` is optional: when set, all eight command roots are synced only to
+that server. Blank means global registration. `DATABASE_URL` is optional for a local
+memory-free run; `/memory enable` requires PostgreSQL. Existing environment variables
+take precedence over `.env`. Restart the bot after configuration changes.
 
 ### 5. Install dependencies
 
@@ -152,14 +188,15 @@ Have a short conversation in the test channel, for example:
 
 Run `/agents` using Discord's slash-command picker. You should get a private status and potentially messages such as `Mira: ...`, `Hex: ...`, and `Moss: ...` (names are bold). Output is generated, so the content and number of speakers vary. All three may stay silent; that is a valid result, not a command failure.
 
-Also test a fresh channel containing only a routine acknowledgment, and an empty channel. The first should encourage silence (not guarantee it); the second should make no LLM calls. Ordinary messages without `/agents` must never trigger a reply. Agent text is capped at 800 characters; Discord mentions are disabled and link previews suppressed.
+Also test a fresh channel containing only a routine acknowledgment, and an empty channel. The first should encourage silence (not guarantee it); the second should make no LLM calls. Ordinary messages never trigger a public reply. With memory enabled they can be buffered and eventually included in one extraction request per 20 messages. Agent text is capped at 800 characters; Discord mentions are disabled and link previews suppressed.
 
 ## Railway hosting
 
 The root `Dockerfile` installs Python 3.12 and starts `python bot.py` as a non-root
 user. Railway [automatically detects the Dockerfile](https://docs.railway.com/builds/dockerfiles).
 This is a continuously running Discord bot, not a website: it does not need a
-domain, public port, HTTP healthcheck, database, or volume. Keep **Serverless / App
+domain, public port, HTTP healthcheck, or volume. Persistent memory uses a linked
+Railway PostgreSQL service; a memory-free deployment can omit it. Keep **Serverless / App
 Sleeping off** and use **one replica in one region**.
 
 Railway hosting charges are separate from OpenAI API usage. If you already have
@@ -182,9 +219,13 @@ other services; check your workspace usage and spending controls.
    | `LLM_PROVIDER` | `openai` |
    | `LLM_MODEL` | `gpt-4.1-mini` (or your current model) |
    | `DISCORD_GUILD_ID` | Your test server's numeric ID |
+   | `DATABASE_URL` | A Railway reference such as `${{Postgres.DATABASE_URL}}` |
 
    Set these as runtime service variables, not Docker build arguments. Do not
    upload `.env` to the repository or add credentials to the Dockerfile.
+   To use memory, add a PostgreSQL service to the same Railway project, then add a
+   `DATABASE_URL` reference in the Ranibot service pointing to that database's
+   `DATABASE_URL`. Do not copy the generated database password into source control.
 4. In service settings, leave the start command unset to use the Dockerfile's
    `CMD` (or set it to `python bot.py`). Leave the HTTP healthcheck path unset,
    disable sleeping, and keep one replica. Use an **On Failure** restart policy
@@ -256,19 +297,37 @@ Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenA
 
 | File | Responsibility |
 | --- | --- |
-| `bot.py` | Discord connection, seven slash commands, three message actions, recent human context, labeled posting |
+| `bot.py` | Discord connection, eight command roots, message observation, memory controls, and labeled posting |
 | `agents.py` | Agent dataclass, personalities, silence parsing, independent calls |
 | `llm.py` | Async provider interface and OpenAI adapter |
 | `config.py` | Validated `.env` configuration |
+| `memory.py` | PostgreSQL schema/store, bounded buffers, and server-memory extraction |
 | `tests/test_ranibot.py` | Offline workflow checks |
 
 To change personalities, edit `AGENTS` in `agents.py`. To add another provider later, implement `generate(system_prompt, context)` and `close()` in `llm.py`, then update its factory and configuration validation. Only `openai` works today; setting a different provider name does not magically add compatibility. The adapter uses the [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text?api-mode=responses). The [default model's documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini) lists supported endpoints; choose a model available to your API project. Reasoning-heavy models may need a larger output budget than this toy's 400-token cap.
 
 ## Privacy and limitations
 
-Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. `/synthesize` sends the same filtered context in one request; `/ask` sends only its question in one request. A message action sends only the selected message text in one request. `/status`, `/help`, `/consent`, and `/chesslab` send nothing to OpenAI. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
+Tell participants before using conversation commands or enabling memory. `/agents`
+sends recent usernames and text to OpenAI in three requests; `/synthesize` sends the
+same filtered context in one. `/ask` and message actions make one request and include
+enabled saved memory. When ambient memory is enabled, Ranibot buffers human text
+from all server channels it can access and sends each 20-message batch to OpenAI in
+one extraction request. Processed raw batches are deleted and unprocessed buffered
+messages expire after seven days; extracted server notes
+and bounded personality journals remain in PostgreSQL until pruned or deleted.
+Memory controls themselves make no AI requests. The bot logs counts and error types,
+not message bodies, database URLs, or API keys. `store=False` disables Responses
+application-state storage, but does **not** guarantee zero provider retention; provider
+policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
 
-This is a toy, not a moderation system or a secure prompt-injection defense. Conversation content is separated from system instructions, and agents have no tools or secrets in their prompts, but model output can still be mistaken or manipulated. Anyone who can use the command can incur API costs. Restrict installation and command access to trusted testers; there is no persistent rate limiter. These commands intentionally avoid persistent memory, autonomous behavior, and system tools.
+This is a toy, not a moderation system or a secure prompt-injection defense.
+Conversation and memory are separated from system instructions, and agents have no
+tools or secrets in their prompts, but output and extracted memories can still be
+mistaken or manipulated. Anyone who can invoke AI features, and anyone who posts in
+an enabled server, can contribute to API usage. Restrict the bot to trusted servers;
+there is no persistent rate limiter. The bot does not autonomously post, browse, or
+use system tools.
 
 ## Troubleshooting
 
@@ -278,3 +337,5 @@ This is a toy, not a moderation system or a secure prompt-injection defense. Con
 - **Forbidden / missing access:** check both server roles and channel overrides. Ensure the bot is actually installed in the configured server and has read/send permissions in that channel.
 - **One or all agents failed:** console logs distinguish timeout, authentication, rate-limit, and other exception types without dumping sensitive API error bodies. Check API key, model access, billing, quota, and connectivity. Incomplete/empty provider output is reported as failure rather than posted as a partial answer.
 - **All agents chose silence:** try a substantive open question in the human discussion, or adjust the personality prompts after observing several trials. Don't add a forced fallback reply; silence is part of the experiment.
+- **Memory says it is unavailable:** attach PostgreSQL and set `DATABASE_URL` on the Ranibot service, then redeploy.
+- **Memory is enabled but still empty:** the first extraction happens after 20 qualifying human messages. Check that the bot can view those channels and that Message Content Intent remains enabled.

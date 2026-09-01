@@ -8,10 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
-from agents import AGENTS, consult_agents, parse_contribution, parse_synthesis, synthesize
+from agents import AGENTS, add_memory_context, consult_agents, parse_contribution, parse_synthesis, synthesize
 from bot import RaniBot, read_context
 from config import Settings
 from llm import OpenAILLM
+from memory import BufferedMessage, Memory, extract_server_memories, parse_memory_candidates
 
 
 def message(text, username="kevin", *, bot=False, system=False, webhook_id=None):
@@ -54,7 +55,9 @@ class FakeLLM:
         self.calls = []
 
     async def generate(self, system_prompt, context):
-        if system_prompt.startswith("You are Ranibot, an AI facilitator"):
+        if system_prompt.startswith("You maintain a small, transparent memory"):
+            name = "MemoryExtractor"
+        elif system_prompt.startswith("You are Ranibot, an AI facilitator"):
             name = "Synthesis"
         elif "selected one Discord message" in system_prompt:
             name = next(agent.name for agent in AGENTS if system_prompt.startswith(f"You are {agent.name},"))
@@ -68,6 +71,65 @@ class FakeLLM:
 
     async def close(self):
         pass
+
+
+class FakeMemoryStore:
+    available = True
+
+    def __init__(self, *, enabled=False, shared=None, journals=None):
+        self.enabled = enabled
+        self.shared = shared or []
+        self.journals = journals or {}
+        self.buffer = []
+        self.saved = []
+        self.agent_turns = []
+        self.deleted = []
+        self.started = False
+        self.closed = False
+
+    async def start(self):
+        self.started = True
+
+    async def close(self):
+        self.closed = True
+
+    async def is_enabled(self, guild_id):
+        return self.enabled
+
+    async def set_enabled(self, guild_id, enabled):
+        self.enabled = enabled
+
+    async def append_message(self, guild_id, channel_id, message_id, author_name, text):
+        self.buffer.append(BufferedMessage(len(self.buffer) + 1, channel_id, message_id, author_name, text))
+        return len(self.buffer)
+
+    async def pending_messages(self, guild_id, limit):
+        return self.buffer[:limit]
+
+    async def save_extraction(self, guild_id, messages, memories):
+        self.saved.append((guild_id, list(messages), list(memories)))
+        ids = {message.id for message in messages}
+        self.buffer = [message for message in self.buffer if message.id not in ids]
+
+    async def add_agent_memory(self, guild_id, scope, content, channel_id, message_id=None):
+        self.agent_turns.append((guild_id, scope, content, channel_id, message_id))
+
+    async def get_context(self, guild_id, scope):
+        return list(self.shared), list(self.journals.get(scope, []))
+
+    async def list_memories(self, guild_id, limit=15):
+        values = [Memory(index + 1, "server", text) for index, text in enumerate(self.shared)]
+        return values[-limit:]
+
+    async def delete_memory(self, guild_id, memory_id):
+        self.deleted.append(memory_id)
+        return memory_id == 1
+
+    async def clear_guild(self, guild_id):
+        count = len(self.shared)
+        self.shared.clear()
+        self.buffer.clear()
+        return count
 
 
 class ContextTests(unittest.IsolatedAsyncioTestCase):
@@ -89,17 +151,23 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_slash_command_registration_and_no_passive_message_subscription(self):
+    async def test_command_registration_and_opt_in_message_subscription(self):
         for guild_id in (None, 123):
             with self.subTest(guild_id=guild_id):
                 bot = RaniBot(Settings("unused", "unused", guild_id=guild_id), FakeLLM({}))
                 slash = bot.tree.get_commands(type=discord.AppCommandType.chat_input)
                 messages = bot.tree.get_commands(type=discord.AppCommandType.message)
-                self.assertEqual({c.name for c in slash}, {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"})
+                expected = {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help", "memory"}
+                self.assertEqual({c.name for c in slash}, expected)
                 self.assertEqual({c.name for c in messages}, {"Ask Mira about this", "Analyze with Hex", "Connect with Moss"})
                 self.assertEqual(bot.tree.get_command("chesslab").parameters, [])
                 self.assertEqual(bot.tree.get_command("synthesize").parameters, [])
                 self.assertEqual(bot.tree.get_command("consent").parameters, [])
+                memory = bot.tree.get_command("memory")
+                self.assertEqual(
+                    {command.name for command in memory.commands},
+                    {"status", "enable", "pause", "list", "forget", "clear"},
+                )
                 self.assertTrue(all(c.guild_only for c in slash))
                 ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
                 self.assertEqual([c["value"] for c in ask_options[0]["choices"]], ["Mira", "Hex", "Moss"])
@@ -107,7 +175,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 command = bot.tree.get_command("agents")
                 self.assertTrue(command.guild_only)
                 self.assertEqual(command.parameters, [])
-                self.assertFalse(bot.intents.messages)
+                self.assertTrue(bot.intents.messages)
                 self.assertTrue(bot.intents.message_content)
                 self.assertEqual(len(bot.cached_messages), 0)
                 bot.tree.sync = AsyncMock()
@@ -117,7 +185,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(guild.id, guild_id)
                     self.assertEqual(
                         {c.name for c in bot.tree.get_commands(guild=guild, type=discord.AppCommandType.chat_input)},
-                        {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"},
+                        expected,
                     )
                     self.assertEqual(
                         {c.name for c in bot.tree.get_commands(guild=guild, type=discord.AppCommandType.message)},
@@ -233,6 +301,109 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         with patch("agents.AGENT_TIMEOUT_SECONDS", 0.02), self.assertLogs("agents", level="WARNING"):
             results = await consult_agents(SimpleNamespace(generate=generate), "[]")
         self.assertEqual([r.agent.name for r in results if r.failed], ["Hex"])
+
+
+class MemoryTests(unittest.IsolatedAsyncioTestCase):
+    def ambient_message(self, number, *, bot=False):
+        item = MagicMock(spec=discord.Message)
+        item.id = number
+        item.guild = SimpleNamespace(id=7)
+        item.channel = SimpleNamespace(id=70)
+        item.author = SimpleNamespace(bot=bot, display_name="Kevin")
+        item.webhook_id = None
+        item.is_system.return_value = False
+        item.clean_content = f"message {number} about our recurring project"
+        return item
+
+    async def test_ambient_memory_is_opt_in_and_extracts_one_batch(self):
+        llm = FakeLLM({"MemoryExtractor": '["The server has a recurring project."]'})
+        store = FakeMemoryStore(enabled=False)
+        bot = RaniBot(Settings("unused", "unused"), llm, store)
+        await bot.on_message(self.ambient_message(1))
+        self.assertEqual(store.buffer, [])
+        store.enabled = True
+        for number in range(1, 20):
+            await bot.on_message(self.ambient_message(number))
+        self.assertEqual(len(store.buffer), 19)
+        self.assertEqual(llm.calls, [])
+        await bot.on_message(self.ambient_message(20))
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(store.buffer, [])
+        self.assertEqual(store.saved[0][2], ["The server has a recurring project."])
+        sent = json.loads(llm.calls[0][1])
+        self.assertEqual(len(sent), 20)
+        self.assertEqual(set(sent[0]), {"author", "text"})
+        await bot.close()
+
+    async def test_agent_request_receives_scoped_memory_and_records_actual_reply(self):
+        llm = FakeLLM({"Hex": "We should define what evidence would change our minds."})
+        store = FakeMemoryStore(
+            enabled=True,
+            shared=["The server discusses distributed cognition."],
+            journals={"Hex": ["Previously questioned a vague definition."]},
+        )
+        bot = RaniBot(Settings("unused", "unused"), llm, store)
+        channel = channel_with([])
+        interaction = interaction_for(channel)
+        interaction.guild.id = 7
+        await bot.run_ask(interaction, "Hex", "Where did we leave this?")
+        payload = json.loads(llm.calls[0][1])
+        self.assertEqual(payload["current_input"], {"question": "Where did we leave this?"})
+        self.assertEqual(payload["shared_server_memory"], store.shared)
+        self.assertEqual(payload["your_previous_contributions"], store.journals["Hex"])
+        self.assertEqual(store.agent_turns[0][1:3], ("Hex", "We should define what evidence would change our minds."))
+        await bot.close()
+
+    async def test_memory_controls_require_manage_server_and_are_private(self):
+        store = FakeMemoryStore(enabled=False, shared=["A stored fact."])
+        bot = RaniBot(Settings("unused", "unused"), FakeLLM({}), store)
+        channel = channel_with([])
+        denied = interaction_for(channel)
+        await bot.run_memory_enable(denied)
+        self.assertFalse(store.enabled)
+        self.assertIn("Manage Server", denied.response.send_message.call_args.args[0])
+
+        admin = interaction_for(channel)
+        admin.permissions.manage_guild = True
+        await bot.run_memory_enable(admin)
+        self.assertTrue(store.enabled)
+        self.assertTrue(admin.response.send_message.call_args.kwargs["ephemeral"])
+        inspect = interaction_for(channel)
+        await bot.run_memory_list(inspect)
+        self.assertIn("A stored fact", inspect.response.send_message.call_args.args[0])
+        forget = interaction_for(channel)
+        forget.permissions.manage_guild = True
+        await bot.run_memory_forget(forget, 1)
+        self.assertEqual(store.deleted, [1])
+        clear = interaction_for(channel)
+        clear.permissions.manage_guild = True
+        await bot.run_memory_clear(clear, True)
+        self.assertEqual(store.shared, [])
+        await bot.close()
+
+    async def test_failed_extraction_keeps_buffer_for_later_retry(self):
+        llm = FakeLLM({"MemoryExtractor": RuntimeError("sensitive-provider-body")})
+        messages = [BufferedMessage(1, 2, 3, "Kevin", "text")]
+        with self.assertLogs("memory", level="WARNING") as logs:
+            result = await extract_server_memories(llm, messages)
+        self.assertIsNone(result)
+        self.assertNotIn("sensitive-provider-body", " ".join(logs.output))
+
+    def test_memory_parser_rejects_non_json_and_caps_candidates(self):
+        self.assertEqual(parse_memory_candidates("not json"), [])
+        self.assertEqual(parse_memory_candidates('{"memory": "wrong shape"}'), [])
+        values = parse_memory_candidates('[" first  fact ", "second", "third", "fourth"]')
+        self.assertEqual(values, ["first fact", "second", "third"])
+        wrapped = parse_memory_candidates('```json\n["remember this"]\n```')
+        self.assertEqual(wrapped, ["remember this"])
+
+    def test_memory_context_is_explicit_and_memory_free_requests_stay_unchanged(self):
+        current = '{"question": "hello"}'
+        self.assertEqual(add_memory_context(current, [], []), current)
+        payload = json.loads(add_memory_context(current, ["server"], ["journal"]))
+        self.assertEqual(payload["current_input"], {"question": "hello"})
+        self.assertEqual(payload["shared_server_memory"], ["server"])
+        self.assertEqual(payload["your_previous_contributions"], ["journal"])
 
 
 class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -490,7 +661,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(post.kwargs["ephemeral"])
         self.assertTrue(post.kwargs["suppress_embeds"])
         self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
-        for phrase in ("**3 requests**", "**1 request**", "selected message text", "store=False", "paid API account", "does not download attachments"):
+        for phrase in ("**3 requests**", "**1 request**", "selected text", "store=False", "paid API account", "never downloads attachments", "20-message batch"):
             self.assertIn(phrase, text)
         self.assertLess(len(text), 2000)
         self.assertEqual(self.llm.calls, [])
@@ -534,6 +705,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**/chesslab**", help_text)
         self.assertIn("**/synthesize**", help_text)
         self.assertIn("**/consent**", help_text)
+        self.assertIn("**/memory", help_text)
         self.assertIn("**Message actions**", help_text)
         for call in self.interaction.response.send_message.call_args_list:
             self.assertTrue(call.kwargs["ephemeral"])
@@ -586,11 +758,15 @@ class ConfigurationAndOutputTests(unittest.TestCase):
 
     @patch("config.load_dotenv")
     def test_configuration_validation_does_not_expose_credentials(self, _):
-        env = {"DISCORD_BOT_TOKEN": "private-token", "LLM_API_KEY": "private-key"}
+        env = {
+            "DISCORD_BOT_TOKEN": "private-token", "LLM_API_KEY": "private-key",
+            "DATABASE_URL": "postgresql://private-database",
+        }
         with patch.dict(os.environ, env, clear=True):
             settings = Settings.from_env()
             self.assertNotIn("private-token", repr(settings))
             self.assertNotIn("private-key", repr(settings))
+            self.assertNotIn("private-database", repr(settings))
             os.environ["DISCORD_GUILD_ID"] = "bad-id"
             with self.assertRaisesRegex(ValueError, "DISCORD_GUILD_ID"):
                 Settings.from_env()
