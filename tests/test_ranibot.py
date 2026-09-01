@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
-from agents import AGENTS, consult_agents, parse_contribution
+from agents import AGENTS, consult_agents, parse_contribution, parse_synthesis, synthesize
 from bot import RaniBot, read_context
 from config import Settings
 from llm import OpenAILLM
@@ -54,7 +54,10 @@ class FakeLLM:
         self.calls = []
 
     async def generate(self, system_prompt, context):
-        name = next(agent.name for agent in AGENTS if system_prompt.startswith(f"You are {agent.name},"))
+        if system_prompt.startswith("You are Ranibot, an AI facilitator"):
+            name = "Synthesis"
+        else:
+            name = next(agent.name for agent in AGENTS if system_prompt.startswith(f"You are {agent.name},"))
         self.calls.append((name, context))
         result = self.replies[name]
         if isinstance(result, Exception):
@@ -88,8 +91,10 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         for guild_id in (None, 123):
             with self.subTest(guild_id=guild_id):
                 bot = RaniBot(Settings("unused", "unused", guild_id=guild_id), FakeLLM({}))
-                self.assertEqual({c.name for c in bot.tree.get_commands()}, {"agents", "ask", "status", "chesslab", "help"})
+                self.assertEqual({c.name for c in bot.tree.get_commands()}, {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"})
                 self.assertEqual(bot.tree.get_command("chesslab").parameters, [])
+                self.assertEqual(bot.tree.get_command("synthesize").parameters, [])
+                self.assertEqual(bot.tree.get_command("consent").parameters, [])
                 self.assertTrue(all(c.guild_only for c in bot.tree.get_commands()))
                 ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
                 self.assertEqual([c["value"] for c in ask_options[0]["choices"]], ["Mira", "Hex", "Moss"])
@@ -105,7 +110,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 if guild_id:
                     guild = bot.tree.sync.call_args.kwargs["guild"]
                     self.assertEqual(guild.id, guild_id)
-                    self.assertEqual({c.name for c in bot.tree.get_commands(guild=guild)}, {"agents", "ask", "status", "chesslab", "help"})
+                    self.assertEqual({c.name for c in bot.tree.get_commands(guild=guild)}, {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"})
                 else:
                     bot.tree.sync.assert_awaited_once_with()
                 await bot.close()
@@ -335,6 +340,83 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertFalse(self.bot.active_channels)
 
+    async def test_synthesize_uses_filtered_context_once_and_posts_safely(self):
+        self.llm.replies["Synthesis"] = "**Common ground:** Measure delayed retention.\n**Open questions:** Which material?"
+        await self.bot.run_synthesize(self.interaction)
+        self.assertEqual(len(self.llm.calls), 1)
+        name, context = self.llm.calls[0]
+        self.assertEqual(name, "Synthesis")
+        self.assertNotIn("private-token", context)
+        self.channel.history.assert_called_once()
+        self.channel.send.assert_awaited_once()
+        post = self.channel.send.call_args
+        self.assertTrue(post.args[0].startswith("**Synthesis:**\n"))
+        self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
+        self.assertTrue(post.kwargs["suppress_embeds"])
+        self.interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_synthesize_insufficient_context_posts_nothing(self):
+        self.llm.replies["Synthesis"] = "INSUFFICIENT"
+        await self.bot.run_synthesize(self.interaction)
+        self.channel.send.assert_not_awaited()
+        self.assertIn("too thin or casual", self.interaction.edit_original_response.call_args.kwargs["content"])
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_synthesize_empty_or_denied_context_never_calls_ai(self):
+        async def empty_history(**kwargs):
+            if False:
+                yield None
+        self.channel.history.side_effect = empty_history
+        await self.bot.run_synthesize(self.interaction)
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.reset_mock()
+        denied = interaction_for(self.channel)
+        denied.app_permissions.read_message_history = False
+        await self.bot.run_synthesize(denied)
+        self.channel.history.assert_not_called()
+        self.assertEqual(self.llm.calls, [])
+
+    async def test_synthesize_failure_is_private_and_releases_channel(self):
+        self.llm.replies["Synthesis"] = RuntimeError("secret-sensitive-body")
+        with self.assertLogs("agents", level="WARNING") as logs:
+            await self.bot.run_synthesize(self.interaction)
+        self.channel.send.assert_not_awaited()
+        status = self.interaction.edit_original_response.call_args.kwargs["content"]
+        self.assertIn("Could not synthesize", status)
+        self.assertNotIn("secret-sensitive-body", status + str(logs.output))
+        self.assertFalse(self.bot.active_channels)
+
+    async def test_synthesize_timeout_returns_failure(self):
+        async def generate(*args):
+            await asyncio.Event().wait()
+        with patch("agents.AGENT_TIMEOUT_SECONDS", 0.02), self.assertLogs("agents", level="WARNING"):
+            result = await synthesize(SimpleNamespace(generate=generate), "[]")
+        self.assertTrue(result.failed)
+        self.assertIsNone(result.text)
+
+    async def test_synthesize_shares_ai_channel_guard(self):
+        self.bot.active_channels.add(self.channel.id)
+        await self.bot.run_synthesize(self.interaction)
+        self.assertIn("already running", self.interaction.edit_original_response.call_args.kwargs["content"])
+        self.channel.history.assert_not_called()
+        self.assertEqual(self.llm.calls, [])
+        self.assertEqual(self.bot.active_channels, {self.channel.id})
+
+    async def test_consent_is_private_complete_and_uses_no_ai_or_history(self):
+        await self.bot.run_consent(self.interaction)
+        post = self.interaction.response.send_message.call_args
+        text = post.args[0]
+        self.assertTrue(post.kwargs["ephemeral"])
+        self.assertTrue(post.kwargs["suppress_embeds"])
+        self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
+        for phrase in ("**3 requests**", "**1 request**", "store=False", "paid API account", "does not download attachments"):
+            self.assertIn(phrase, text)
+        self.assertLess(len(text), 2000)
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.assert_not_called()
+        self.channel.send.assert_not_awaited()
+
     async def test_chesslab_shares_public_link_without_ai_history_or_account_access(self):
         self.interaction.app_permissions.read_message_history = False
         self.interaction.permissions.read_message_history = False
@@ -368,7 +450,10 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not measured yet", status)
         self.assertIn("does not check API billing", status)
         await self.bot.run_help(self.interaction)
-        self.assertIn("**/chesslab**", self.interaction.response.send_message.call_args.args[0])
+        help_text = self.interaction.response.send_message.call_args.args[0]
+        self.assertIn("**/chesslab**", help_text)
+        self.assertIn("**/synthesize**", help_text)
+        self.assertIn("**/consent**", help_text)
         for call in self.interaction.response.send_message.call_args_list:
             self.assertTrue(call.kwargs["ephemeral"])
             self.assertEqual(call.kwargs["allowed_mentions"].to_dict()["parse"], [])
@@ -412,6 +497,11 @@ class ConfigurationAndOutputTests(unittest.TestCase):
         text = parse_contribution("🌱" * 2000)
         self.assertLessEqual(len(text), 800)
         self.assertLess(len(f"**Mira:** {text}".encode("utf-16-le")) // 2, 2000)
+        for value in ("INSUFFICIENT", " insufficient. ", "`INSUFFICIENT`", ""):
+            self.assertIsNone(parse_synthesis(value))
+        synthesis = parse_synthesis("🌱" * 3000)
+        self.assertLessEqual(len(synthesis), 1500)
+        self.assertLess(len(f"**Synthesis:**\n{synthesis}"), 2000)
 
     @patch("config.load_dotenv")
     def test_configuration_validation_does_not_expose_credentials(self, _):

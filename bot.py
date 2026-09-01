@@ -11,7 +11,7 @@ from typing import Literal
 import discord
 from discord import app_commands
 
-from agents import AGENTS, consider, consult_agents
+from agents import AGENTS, consider, consult_agents, synthesize
 from config import Settings
 from llm import LLM, create_llm
 
@@ -62,6 +62,8 @@ class RaniBot(discord.Client):
             ("ask", "Ask one agent a question; only that question goes to AI. Reply is public.", self.run_ask),
             ("status", "Show uptime and configured model without making an AI request.", self.run_status),
             ("chesslab", "Share the Chess Lab app link and introduction; no AI request.", self.run_chesslab),
+            ("synthesize", "Map recent common ground, tensions, and open questions with one AI request.", self.run_synthesize),
+            ("consent", "Explain exactly what Ranibot reads, sends, stores, and costs.", self.run_consent),
             ("help", "Explain Ranibot's commands and what gets sent to AI.", self.run_help),
         ):
             command = app_commands.Command(name=name, description=description, callback=callback)
@@ -74,10 +76,10 @@ class RaniBot(discord.Client):
             guild = discord.Object(id=self.settings.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info("Synced /agents, /ask, /status, /chesslab, /help to test server %s", guild.id)
+            logger.info("Synced /agents, /ask, /status, /chesslab, /synthesize, /consent, /help to test server %s", guild.id)
         else:
             await self.tree.sync()
-            logger.info("Synced /agents, /ask, /status, /chesslab, /help globally")
+            logger.info("Synced /agents, /ask, /status, /chesslab, /synthesize, /consent, /help globally")
 
     async def on_ready(self) -> None:
         logger.info("Ranibot connected as bot ID %s", self.user.id)
@@ -215,6 +217,65 @@ class RaniBot(discord.Client):
             ephemeral=False, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 
+    async def run_synthesize(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel = interaction.channel
+        if interaction.guild is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Use /synthesize in a server text channel or thread.")
+            return
+        permissions = interaction.app_permissions
+        can_send = permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages
+        if not (permissions.view_channel and permissions.read_message_history and can_send):
+            await interaction.edit_original_response(
+                content="I need View Channel, Read Message History, and Send Messages "
+                        "(Send Messages in Threads for a thread) here."
+            )
+            return
+        if not interaction.permissions.read_message_history:
+            await interaction.edit_original_response(content="You need Read Message History to invoke /synthesize here.")
+            return
+        if channel.id in self.active_channels:
+            await interaction.edit_original_response(content="An AI request is already running in this channel. Try again when it finishes.")
+            return
+
+        self.active_channels.add(channel.id)
+        try:
+            context = await read_context(channel, before=interaction.created_at)
+            if context is None:
+                await interaction.edit_original_response(content="No readable human text in the last 30 messages to synthesize.")
+                return
+            logger.info("Synthesizing conversation in channel %s", channel.id)
+            result = await synthesize(self.llm, context)
+            if result.failed:
+                await interaction.edit_original_response(content="Could not synthesize the conversation. Try again later; check the bot logs if this persists.")
+            elif not result.text:
+                await interaction.edit_original_response(content="The recent conversation is too thin or casual to synthesize honestly.")
+            else:
+                await channel.send(
+                    f"**Synthesis:**\n{result.text}",
+                    allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
+                )
+                await interaction.edit_original_response(content="Posted one synthesis of the recent human conversation.")
+        except discord.Forbidden:
+            logger.warning("Discord access denied during /synthesize in channel %s", channel.id)
+            await interaction.edit_original_response(content="Discord denied access while reading or posting. Check channel permissions.")
+        except discord.HTTPException as exc:
+            logger.warning("Discord /synthesize request failed in channel %s (HTTP %s)", channel.id, exc.status)
+            await interaction.edit_original_response(content="Discord could not complete the synthesis. Check the channel before retrying.")
+        finally:
+            self.active_channels.discard(channel.id)
+
+    async def run_consent(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            "**Ranibot data and cost guide**\n"
+            "**/agents:** reads up to 30 recent messages, removes bot/webhook/system and empty messages, then sends human usernames, display names, and text to OpenAI in **3 requests**.\n"
+            "**/synthesize:** sends that same filtered recent context to OpenAI in **1 request**.\n"
+            "**/ask:** sends only the question you type to OpenAI in **1 request**; it does not read channel history.\n"
+            "**/status, /help, /consent, /chesslab:** make **0 AI requests**.\n\n"
+            "Ranibot does not download attachments, open links, browse the web, access your computer, or keep a database or persistent memory. AI answers and syntheses are public; command status messages are private. The bot does not save transcripts to disk and requests `store=False`, but OpenAI may retain data under its abuse-monitoring policies. AI output can be wrong. Ask participants before sending their conversation, avoid secrets, and remember that /agents, /synthesize, and /ask use the bot owner's paid API account.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
+        )
+
     async def run_help(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "**Ranibot commands**\n"
@@ -222,9 +283,11 @@ class RaniBot(discord.Client):
             "**/ask agent question** — Sends only your question to one chosen agent and posts a short, labeled answer publicly. No channel history is read.\n"
             "**/status** — Shows uptime and the configured model; makes no AI request.\n"
             "**/chesslab** — Publicly shares the Chess Lab link and introduction; no game access or AI request.\n"
+            "**/synthesize** — Sends recent filtered human chat in one AI request and publicly maps common ground, tensions, open questions, and a possible next step.\n"
+            "**/consent** — Privately explains exactly what Ranibot reads, sends, stores, and costs; no AI request.\n"
             "**/help** — Shows this private guide; makes no AI request.\n\n"
-            "**Privacy and cost:** /agents sends recent usernames and text to OpenAI in three requests. /ask sends your question in one request. Both use paid API usage. Avoid sharing secrets and get participants' agreement before using /agents.\n"
-            "The bot has no persistent memory or access to your computer, does not browse links, and reads chat only when /agents is invoked. AI replies can be wrong.",
+            "**Privacy and cost:** /agents sends recent usernames and text to OpenAI in three requests; /synthesize sends the same filtered context in one. /ask sends only your question in one request. These use paid API usage. Avoid sharing secrets and get participants' agreement before using /agents.\n"
+            "The bot has no persistent memory or access to your computer, does not browse links, and reads chat only when /agents or /synthesize is invoked. AI replies can be wrong.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 

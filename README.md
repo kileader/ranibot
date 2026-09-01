@@ -23,6 +23,8 @@ There is no database, persistent memory, background participation, tool executio
 | `/ask agent question` | Asks Mira, Hex, or Moss directly, using only your question | 1 for a valid, permitted request | One short labeled answer if successful |
 | `/status` | Shows process uptime, Discord heartbeat latency, and configured model | 0 | None; private response |
 | `/chesslab` | Shares the Chess Lab app link and a short introduction | 0 | One message with the app link |
+| `/synthesize` | Maps recent common ground, tensions, open questions, and a possible next step | 1 when there is readable human text | One compact synthesis if the discussion supports it |
+| `/consent` | Explains what Ranibot reads, sends, stores, and costs | 0 | None; private response |
 | `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
 
 For example, use `/ask`, select **Hex**, and enter "How could I measure whether my
@@ -38,6 +40,12 @@ Both suppress mentions and link previews. No command gives agents tools or acces
 to your computer. `/status` reports configuration; it does not test OpenAI access,
 billing, or available credit. Uptime resets when Railway restarts the process.
 
+`/synthesize` uses the same 30-message human-only snapshot as `/agents`, but makes
+one call with a neutral facilitator prompt. It avoids inventing consensus, labels
+inference and uncertainty, and can decline when the discussion is too thin. Its
+result is public and capped at 1,500 characters. `/consent` is a private, fixed
+explanation of data flow and cost; it neither reads history nor calls OpenAI.
+
 `/chesslab` posts a fixed introduction and a link to
 [Chess Lab](https://chess-lab-zeta.vercel.app). It does not read channel history,
 call AI, fetch the website, link accounts, or access anyone's games. The response
@@ -45,7 +53,7 @@ is public, with mentions and link previews suppressed. Chess Lab sign-in happens
 on the website, and game libraries remain private. No new configuration or
 permissions are required.
 
-All five commands follow `DISCORD_GUILD_ID`: a configured test server receives the
+All seven commands follow `DISCORD_GUILD_ID`: a configured test server receives the
 commands immediately; leaving it blank registers them globally on startup.
 
 ## Windows PowerShell setup
@@ -96,9 +104,9 @@ LLM_MODEL=gpt-4.1-mini
 DISCORD_GUILD_ID=your_numeric_test_server_id
 ```
 
-Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/ask` sends one request to its selected agent. No automatic retries are configured.
+Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/synthesize` sends one request with the same filtered context, and `/ask` sends one request to its selected agent. No automatic retries are configured.
 
-`DISCORD_GUILD_ID` is optional but recommended: when set, all five commands are synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
+`DISCORD_GUILD_ID` is optional but recommended: when set, all seven commands are synced only to that server. Blank means global registration, which may take longer to appear. Use one registration mode consistently while testing; switching modes does not delete commands previously registered in the other scope. Existing environment variables take precedence over `.env`. Restart the bot after configuration changes.
 
 ### 5. Install dependencies
 
@@ -227,13 +235,13 @@ A Railway-hosted process cannot directly read your home PC's temperatures or usa
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenAI SDK call. They check context boundaries and ordering, silent decisions, labeled posting, mention suppression, empty channels, overlapping invocations, permission failures, partial API failure, timeouts, direct-question isolation, utility commands without AI calls, and the provider request contract. They do not contact Discord/OpenAI or require `.env`. Real credentials and a test server are still needed to verify live permissions, command visibility, model access, and response quality.
+Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenAI SDK call. They check context boundaries and ordering, silent decisions, labeled posting, mention suppression, empty channels, overlapping invocations, permission failures, partial API failure, timeouts, direct-question isolation, synthesis boundaries and failures, utility commands without AI calls, and the provider request contract. They do not contact Discord/OpenAI or require `.env`. Real credentials and a test server are still needed to verify live permissions, command visibility, model access, and response quality.
 
 ## Small code map
 
 | File | Responsibility |
 | --- | --- |
-| `bot.py` | Discord connection, five slash commands, recent human context, labeled posting |
+| `bot.py` | Discord connection, seven slash commands, recent human context, labeled posting |
 | `agents.py` | Agent dataclass, personalities, silence parsing, independent calls |
 | `llm.py` | Async provider interface and OpenAI adapter |
 | `config.py` | Validated `.env` configuration |
@@ -243,7 +251,7 @@ To change personalities, edit `AGENTS` in `agents.py`. To add another provider l
 
 ## Privacy and limitations
 
-Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. `/ask` sends only its question in one request; `/status` and `/help` send nothing to OpenAI. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
+Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. `/synthesize` sends the same filtered context in one request; `/ask` sends only its question in one request. `/status`, `/help`, `/consent`, and `/chesslab` send nothing to OpenAI. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
 
 This is a toy, not a moderation system or a secure prompt-injection defense. Conversation content is separated from system instructions, and agents have no tools or secrets in their prompts, but model output can still be mistaken or manipulated. Anyone who can use the command can incur API costs. Restrict installation and command access to trusted testers; there is no persistent rate limiter. These commands intentionally avoid persistent memory, autonomous behavior, and system tools.
 
