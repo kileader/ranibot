@@ -11,7 +11,7 @@ from typing import Literal
 import discord
 from discord import app_commands
 
-from agents import AGENTS, consider, consult_agents, synthesize
+from agents import AGENTS, consider, consider_selected_message, consult_agents, synthesize
 from config import Settings
 from llm import LLM, create_llm
 
@@ -69,6 +69,12 @@ class RaniBot(discord.Client):
             command = app_commands.Command(name=name, description=description, callback=callback)
             command.guild_only = True
             self.tree.add_command(command)
+        for name, callback in (
+            ("Ask Mira about this", self.message_mira),
+            ("Analyze with Hex", self.message_hex),
+            ("Connect with Moss", self.message_moss),
+        ):
+            self.tree.add_command(app_commands.ContextMenu(name=name, callback=callback))
         self.tree.on_error = self.on_command_error
 
     async def setup_hook(self) -> None:
@@ -76,10 +82,10 @@ class RaniBot(discord.Client):
             guild = discord.Object(id=self.settings.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info("Synced /agents, /ask, /status, /chesslab, /synthesize, /consent, /help to test server %s", guild.id)
+            logger.info("Synced seven slash commands and three message actions to test server %s", guild.id)
         else:
             await self.tree.sync()
-            logger.info("Synced /agents, /ask, /status, /chesslab, /synthesize, /consent, /help globally")
+            logger.info("Synced seven slash commands and three message actions globally")
 
     async def on_ready(self) -> None:
         logger.info("Ranibot connected as bot ID %s", self.user.id)
@@ -193,6 +199,60 @@ class RaniBot(discord.Client):
         finally:
             self.active_channels.discard(channel.id)
 
+    async def message_mira(self, interaction: discord.Interaction, message: discord.Message) -> None:
+        await self._run_message_agent(interaction, message, "Mira")
+
+    async def message_hex(self, interaction: discord.Interaction, message: discord.Message) -> None:
+        await self._run_message_agent(interaction, message, "Hex")
+
+    async def message_moss(self, interaction: discord.Interaction, message: discord.Message) -> None:
+        await self._run_message_agent(interaction, message, "Moss")
+
+    async def _run_message_agent(
+        self, interaction: discord.Interaction, message: discord.Message, agent_name: str,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel = interaction.channel
+        if interaction.guild is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Use this message action in a server text channel or thread.")
+            return
+        permissions = interaction.app_permissions
+        can_send = permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages
+        if not (permissions.view_channel and can_send):
+            await interaction.edit_original_response(content="I need View Channel and Send Messages (Send Messages in Threads for a thread) here.")
+            return
+        text = message.clean_content.strip()
+        if not text:
+            await interaction.edit_original_response(content="That message has no readable text. Attachments and embeds are not sent to AI.")
+            return
+        if len(text) > MAX_MESSAGE_CHARS:
+            text = text[:MAX_MESSAGE_CHARS] + " [truncated]"
+        if channel.id in self.active_channels:
+            await interaction.edit_original_response(content="An AI request is already running in this channel. Try again when it finishes.")
+            return
+        selected = next(agent for agent in AGENTS if agent.name == agent_name)
+
+        self.active_channels.add(channel.id)
+        try:
+            logger.info("Handling selected-message action for %s in channel %s", selected.name, channel.id)
+            context = json.dumps({"selected_message": text}, ensure_ascii=False)
+            result = await consider_selected_message(selected, self.llm, context)
+            if result.failed:
+                await interaction.edit_original_response(content=f"Could not get a response from {selected.name}. Try again later.")
+            elif not result.text:
+                await interaction.edit_original_response(content=f"{selected.name} did not return a response for that message.")
+            else:
+                await message.reply(
+                    f"**{selected.name}:** {result.text}", mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
+                )
+                await interaction.edit_original_response(content=f"{selected.name} replied to the selected message.")
+        except discord.HTTPException as exc:
+            logger.warning("Discord message action failed in channel %s (HTTP %s)", channel.id, exc.status)
+            await interaction.edit_original_response(content="Discord could not post the reply. Check the channel before retrying.")
+        finally:
+            self.active_channels.discard(channel.id)
+
     async def run_status(self, interaction: discord.Interaction) -> None:
         seconds = max(0, int(time.monotonic() - self.started_at))
         days, seconds = divmod(seconds, 86400)
@@ -271,8 +331,9 @@ class RaniBot(discord.Client):
             "**/agents:** reads up to 30 recent messages, removes bot/webhook/system and empty messages, then sends human usernames, display names, and text to OpenAI in **3 requests**.\n"
             "**/synthesize:** sends that same filtered recent context to OpenAI in **1 request**.\n"
             "**/ask:** sends only the question you type to OpenAI in **1 request**; it does not read channel history.\n"
+            "**Message actions:** send only the selected message text to one chosen personality in **1 request**; they do not read surrounding history.\n"
             "**/status, /help, /consent, /chesslab:** make **0 AI requests**.\n\n"
-            "Ranibot does not download attachments, open links, browse the web, access your computer, or keep a database or persistent memory. AI answers and syntheses are public; command status messages are private. The bot does not save transcripts to disk and requests `store=False`, but OpenAI may retain data under its abuse-monitoring policies. AI output can be wrong. Ask participants before sending their conversation, avoid secrets, and remember that /agents, /synthesize, and /ask use the bot owner's paid API account.",
+            "Ranibot does not download attachments, open links, browse the web, access your computer, or keep a database or persistent memory. AI answers and syntheses are public; command status messages are private. The bot does not save transcripts to disk and requests `store=False`, but OpenAI may retain data under its abuse-monitoring policies. AI output can be wrong. Ask participants before sending their conversation, avoid secrets, and remember that /agents, /synthesize, /ask, and message actions use the bot owner's paid API account.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 
@@ -285,8 +346,9 @@ class RaniBot(discord.Client):
             "**/chesslab** — Publicly shares the Chess Lab link and introduction; no game access or AI request.\n"
             "**/synthesize** — Sends recent filtered human chat in one AI request and publicly maps common ground, tensions, open questions, and a possible next step.\n"
             "**/consent** — Privately explains exactly what Ranibot reads, sends, stores, and costs; no AI request.\n"
-            "**/help** — Shows this private guide; makes no AI request.\n\n"
-            "**Privacy and cost:** /agents sends recent usernames and text to OpenAI in three requests; /synthesize sends the same filtered context in one. /ask sends only your question in one request. These use paid API usage. Avoid sharing secrets and get participants' agreement before using /agents.\n"
+            "**/help** — Shows this private guide; makes no AI request.\n"
+            "**Message actions** — Right-click a message, choose Apps, then Ask Mira, Analyze with Hex, or Connect with Moss. Only the selected text is sent in one AI request.\n\n"
+            "**Privacy and cost:** /agents sends recent usernames and text to OpenAI in three requests; /synthesize sends the same filtered context in one. /ask sends only your question in one request, and message actions send only the selected text in one request. These use paid API usage. Avoid sharing secrets and get participants' agreement before using /agents.\n"
             "The bot has no persistent memory or access to your computer, does not browse links, and reads chat only when /agents or /synthesize is invoked. AI replies can be wrong.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )

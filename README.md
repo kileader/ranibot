@@ -11,9 +11,9 @@ Normal conversation → `/agents` → three independent decisions → zero to th
 
 The bot fetches the latest **30 channel messages before the command was invoked**, excludes bots, webhooks, system messages, and empty text, then gives each agent the same chronological human transcript. This can mean fewer than 30 human messages. It includes usernames, display names, and text, with each message limited to 1,500 characters. It doesn't download attachments or open links.
 
-Each agent makes one LLM call that returns either a short contribution or `SILENT`. All three calls run concurrently; contributions are posted in Mira/Hex/Moss order. Silence produces no public message. Status and errors are private to whoever ran the command. AI commands permit only one active run per channel, within this bot process.
+Each agent makes one LLM call that returns either a short contribution or `SILENT`. All three calls run concurrently; contributions are posted in Mira/Hex/Moss order. Silence produces no public message. Status and errors are private to whoever ran the command. AI slash commands and message actions permit only one active run per channel, within this bot process.
 
-There is no database, persistent memory, background participation, tool execution, browsing, Moltbook integration, webhook identity, or multi-bot setup. No message events are subscribed to and no Discord message cache is kept. History is fetched only inside `/agents`. Earlier bot replies are excluded too: v0 does not conduct agent-to-agent debates or remember its previous contributions. Repeated commands on unchanged chat may produce similar replies.
+There is no database, persistent memory, background participation, tool execution, browsing, Moltbook integration, webhook identity, or multi-bot setup. No message events are subscribed to and no Discord message cache is kept. History is fetched only inside `/agents` or `/synthesize`. Earlier bot replies are excluded too: v0 does not conduct agent-to-agent debates or remember its previous contributions. Repeated commands on unchanged chat may produce similar replies.
 
 ## Commands
 
@@ -26,6 +26,21 @@ There is no database, persistent memory, background participation, tool executio
 | `/synthesize` | Maps recent common ground, tensions, open questions, and a possible next step | 1 when there is readable human text | One compact synthesis if the discussion supports it |
 | `/consent` | Explains what Ranibot reads, sends, stores, and costs | 0 | None; private response |
 | `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
+
+### Message actions
+
+Right-click a text message and choose **Apps** to use one of these actions:
+
+- **Ask Mira about this**
+- **Analyze with Hex**
+- **Connect with Moss**
+
+Each action sends only the selected message text to one personality in one paid AI
+request, then replies publicly to that message. It does not send the author name,
+surrounding conversation, attachments, embeds, or linked-page contents. Ranibot
+still does not subscribe to passive message events. Empty messages are rejected and
+selected text is capped at 1,500 characters. Mentions and link previews are
+suppressed in the generated reply.
 
 For example, use `/ask`, select **Hex**, and enter "How could I measure whether my
 study schedule improves retention?" The question is limited to 1,500 characters;
@@ -235,13 +250,13 @@ A Railway-hosted process cannot directly read your home PC's temperatures or usa
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenAI SDK call. They check context boundaries and ordering, silent decisions, labeled posting, mention suppression, empty channels, overlapping invocations, permission failures, partial API failure, timeouts, direct-question isolation, synthesis boundaries and failures, utility commands without AI calls, and the provider request contract. They do not contact Discord/OpenAI or require `.env`. Real credentials and a test server are still needed to verify live permissions, command visibility, model access, and response quality.
+Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenAI SDK call. They check context boundaries and ordering, silent decisions, labeled posting, mention suppression, empty channels, overlapping invocations, permission failures, partial API failure, timeouts, direct-question isolation, synthesis boundaries and failures, selected-message isolation, utility commands without AI calls, and the provider request contract. They do not contact Discord/OpenAI or require `.env`. Real credentials and a test server are still needed to verify live permissions, command visibility, model access, and response quality.
 
 ## Small code map
 
 | File | Responsibility |
 | --- | --- |
-| `bot.py` | Discord connection, seven slash commands, recent human context, labeled posting |
+| `bot.py` | Discord connection, seven slash commands, three message actions, recent human context, labeled posting |
 | `agents.py` | Agent dataclass, personalities, silence parsing, independent calls |
 | `llm.py` | Async provider interface and OpenAI adapter |
 | `config.py` | Validated `.env` configuration |
@@ -251,7 +266,7 @@ To change personalities, edit `AGENTS` in `agents.py`. To add another provider l
 
 ## Privacy and limitations
 
-Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. `/synthesize` sends the same filtered context in one request; `/ask` sends only its question in one request. `/status`, `/help`, `/consent`, and `/chesslab` send nothing to OpenAI. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
+Use an opt-in test channel: tell participants that invoking `/agents` sends recent usernames and message text to OpenAI in three separate requests. `/synthesize` sends the same filtered context in one request; `/ask` sends only its question in one request. A message action sends only the selected message text in one request. `/status`, `/help`, `/consent`, and `/chesslab` send nothing to OpenAI. The bot keeps no transcripts on disk and logs decisions/error types rather than message bodies or API keys. `store=False` disables Responses application-state storage, but does **not** guarantee zero provider retention; provider abuse-monitoring policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
 
 This is a toy, not a moderation system or a secure prompt-injection defense. Conversation content is separated from system instructions, and agents have no tools or secrets in their prompts, but model output can still be mistaken or manipulated. Anyone who can use the command can incur API costs. Restrict installation and command access to trusted testers; there is no persistent rate limiter. These commands intentionally avoid persistent memory, autonomous behavior, and system tools.
 

@@ -56,6 +56,8 @@ class FakeLLM:
     async def generate(self, system_prompt, context):
         if system_prompt.startswith("You are Ranibot, an AI facilitator"):
             name = "Synthesis"
+        elif "selected one Discord message" in system_prompt:
+            name = next(agent.name for agent in AGENTS if system_prompt.startswith(f"You are {agent.name},"))
         else:
             name = next(agent.name for agent in AGENTS if system_prompt.startswith(f"You are {agent.name},"))
         self.calls.append((name, context))
@@ -91,11 +93,14 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         for guild_id in (None, 123):
             with self.subTest(guild_id=guild_id):
                 bot = RaniBot(Settings("unused", "unused", guild_id=guild_id), FakeLLM({}))
-                self.assertEqual({c.name for c in bot.tree.get_commands()}, {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"})
+                slash = bot.tree.get_commands(type=discord.AppCommandType.chat_input)
+                messages = bot.tree.get_commands(type=discord.AppCommandType.message)
+                self.assertEqual({c.name for c in slash}, {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"})
+                self.assertEqual({c.name for c in messages}, {"Ask Mira about this", "Analyze with Hex", "Connect with Moss"})
                 self.assertEqual(bot.tree.get_command("chesslab").parameters, [])
                 self.assertEqual(bot.tree.get_command("synthesize").parameters, [])
                 self.assertEqual(bot.tree.get_command("consent").parameters, [])
-                self.assertTrue(all(c.guild_only for c in bot.tree.get_commands()))
+                self.assertTrue(all(c.guild_only for c in slash))
                 ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
                 self.assertEqual([c["value"] for c in ask_options[0]["choices"]], ["Mira", "Hex", "Moss"])
                 self.assertEqual((ask_options[1]["min_length"], ask_options[1]["max_length"]), (1, 1500))
@@ -110,7 +115,14 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 if guild_id:
                     guild = bot.tree.sync.call_args.kwargs["guild"]
                     self.assertEqual(guild.id, guild_id)
-                    self.assertEqual({c.name for c in bot.tree.get_commands(guild=guild)}, {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"})
+                    self.assertEqual(
+                        {c.name for c in bot.tree.get_commands(guild=guild, type=discord.AppCommandType.chat_input)},
+                        {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help"},
+                    )
+                    self.assertEqual(
+                        {c.name for c in bot.tree.get_commands(guild=guild, type=discord.AppCommandType.message)},
+                        {"Ask Mira about this", "Analyze with Hex", "Connect with Moss"},
+                    )
                 else:
                     bot.tree.sync.assert_awaited_once_with()
                 await bot.close()
@@ -340,6 +352,74 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertFalse(self.bot.active_channels)
 
+    async def test_message_actions_send_only_selected_text_to_one_personality(self):
+        self.llm.replies.update({"Mira": "Possibility.", "Hex": "Analysis.", "Moss": "Connection."})
+        for method, expected in [
+            (self.bot.message_mira, "Mira"),
+            (self.bot.message_hex, "Hex"),
+            (self.bot.message_moss, "Moss"),
+        ]:
+            with self.subTest(agent=expected):
+                interaction = interaction_for(self.channel)
+                target = MagicMock(spec=discord.Message)
+                target.clean_content = "  selected text only  "
+                target.reply = AsyncMock()
+                await method(interaction, target)
+                name, context = self.llm.calls[-1]
+                self.assertEqual(name, expected)
+                self.assertEqual(context, '{"selected_message": "selected text only"}')
+                self.channel.history.assert_not_called()
+                target.reply.assert_awaited_once()
+                post = target.reply.call_args
+                self.assertTrue(post.args[0].startswith(f"**{expected}:** "))
+                self.assertFalse(post.kwargs["mention_author"])
+                self.assertTrue(post.kwargs["suppress_embeds"])
+                self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
+                self.assertFalse(self.bot.active_channels)
+        self.assertEqual(len(self.llm.calls), 3)
+
+    async def test_message_action_rejects_empty_or_denied_message_without_ai(self):
+        target = MagicMock(spec=discord.Message)
+        target.clean_content = "   "
+        target.reply = AsyncMock()
+        await self.bot.message_mira(self.interaction, target)
+        denied = interaction_for(self.channel)
+        denied.app_permissions.send_messages = False
+        target.clean_content = "selected"
+        await self.bot.message_mira(denied, target)
+        self.assertEqual(self.llm.calls, [])
+        self.channel.history.assert_not_called()
+        target.reply.assert_not_awaited()
+
+    async def test_message_action_failure_and_guard_never_post_fallback(self):
+        target = MagicMock(spec=discord.Message)
+        target.clean_content = "selected"
+        target.reply = AsyncMock()
+        self.llm.replies["Hex"] = RuntimeError("secret-sensitive-body")
+        with self.assertLogs("agents", level="WARNING") as logs:
+            await self.bot.message_hex(self.interaction, target)
+        status = self.interaction.edit_original_response.call_args.kwargs["content"]
+        self.assertIn("Could not get a response", status)
+        self.assertNotIn("secret-sensitive-body", status + str(logs.output))
+        target.reply.assert_not_awaited()
+        self.assertFalse(self.bot.active_channels)
+        self.bot.active_channels.add(self.channel.id)
+        second = interaction_for(self.channel)
+        await self.bot.message_mira(second, target)
+        self.assertIn("already running", second.edit_original_response.call_args.kwargs["content"])
+        self.assertEqual(len(self.llm.calls), 1)
+        self.assertEqual(self.bot.active_channels, {self.channel.id})
+
+    async def test_message_action_truncates_selected_text(self):
+        self.llm.replies["Mira"] = "Response."
+        target = MagicMock(spec=discord.Message)
+        target.clean_content = "x" * 2000
+        target.reply = AsyncMock()
+        await self.bot.message_mira(self.interaction, target)
+        context = json.loads(self.llm.calls[0][1])
+        self.assertEqual(len(context["selected_message"]), 1512)
+        self.assertTrue(context["selected_message"].endswith(" [truncated]"))
+
     async def test_synthesize_uses_filtered_context_once_and_posts_safely(self):
         self.llm.replies["Synthesis"] = "**Common ground:** Measure delayed retention.\n**Open questions:** Which material?"
         await self.bot.run_synthesize(self.interaction)
@@ -410,7 +490,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(post.kwargs["ephemeral"])
         self.assertTrue(post.kwargs["suppress_embeds"])
         self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
-        for phrase in ("**3 requests**", "**1 request**", "store=False", "paid API account", "does not download attachments"):
+        for phrase in ("**3 requests**", "**1 request**", "selected message text", "store=False", "paid API account", "does not download attachments"):
             self.assertIn(phrase, text)
         self.assertLess(len(text), 2000)
         self.assertEqual(self.llm.calls, [])
@@ -454,6 +534,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**/chesslab**", help_text)
         self.assertIn("**/synthesize**", help_text)
         self.assertIn("**/consent**", help_text)
+        self.assertIn("**Message actions**", help_text)
         for call in self.interaction.response.send_message.call_args_list:
             self.assertTrue(call.kwargs["ephemeral"])
             self.assertEqual(call.kwargs["allowed_mentions"].to_dict()["parse"], [])
