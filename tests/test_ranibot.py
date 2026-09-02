@@ -157,7 +157,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 bot = RaniBot(Settings("unused", "unused", guild_id=guild_id), FakeLLM({}))
                 slash = bot.tree.get_commands(type=discord.AppCommandType.chat_input)
                 messages = bot.tree.get_commands(type=discord.AppCommandType.message)
-                expected = {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help", "memory"}
+                expected = {"agents", "ask", "status", "chesslab", "synthesize", "consent", "help", "memory", "scenario"}
                 self.assertEqual({c.name for c in slash}, expected)
                 self.assertEqual({c.name for c in messages}, {"Ask Mira about this", "Analyze with Hex", "Connect with Moss"})
                 self.assertEqual(bot.tree.get_command("chesslab").parameters, [])
@@ -167,6 +167,11 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     {command.name for command in memory.commands},
                     {"status", "enable", "pause", "list", "forget", "clear"},
+                )
+                scenario = bot.tree.get_command("scenario")
+                self.assertEqual(
+                    {command.name for command in scenario.commands},
+                    {"create", "news", "deepen"},
                 )
                 self.assertTrue(all(c.guild_only for c in slash))
                 ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
@@ -661,7 +666,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(post.kwargs["ephemeral"])
         self.assertTrue(post.kwargs["suppress_embeds"])
         self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
-        for phrase in ("**3 requests**", "**1 request**", "selected text", "store=False", "paid API account", "never downloads attachments", "20-message batch"):
+        for phrase in ("**3 requests**", "**1 request**", "selected text", "store=False", "paid API account", "never downloads attachments", "20-message batch", "/scenario deepen"):
             self.assertIn(phrase, text)
         self.assertLess(len(text), 2000)
         self.assertEqual(self.llm.calls, [])

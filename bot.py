@@ -21,11 +21,21 @@ from memory import (
     create_memory_store,
     extract_server_memories,
 )
+from scenarios import (
+    SCENARIO_MARKER,
+    Story,
+    deepen_scenario,
+    fetch_article,
+    fetch_news,
+    format_scenario,
+    generate_scenario,
+)
 
 logger = logging.getLogger(__name__)
 HISTORY_LIMIT = 30
 MAX_MESSAGE_CHARS = 1500
 MAX_QUESTION_CHARS = 1500
+MIN_SCENARIO_DISCUSSION_MESSAGES = 2
 
 
 async def read_context(channel: discord.TextChannel | discord.Thread, before: datetime) -> str | None:
@@ -48,6 +58,77 @@ async def read_context(channel: discord.TextChannel | discord.Thread, before: da
         return None
     messages.reverse()
     return json.dumps(messages, ensure_ascii=False)
+
+
+async def read_scenario_discussion(
+    channel: discord.TextChannel | discord.Thread, before: datetime, bot_id: int,
+) -> tuple[str | None, str | None, int]:
+    """Find the latest Ranibot scenario and human discussion that followed it."""
+    scenario_text = None
+    if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.TextChannel):
+        try:
+            starter = await channel.parent.fetch_message(channel.id)
+            if starter.author.id == bot_id and starter.content.startswith(SCENARIO_MARKER):
+                scenario_text = starter.content
+        except (discord.HTTPException, AttributeError):
+            pass
+
+    messages = []
+    async for message in channel.history(limit=60, before=before, oldest_first=False):
+        content = message.clean_content.strip()
+        if message.author.id == bot_id and content.startswith(SCENARIO_MARKER):
+            scenario_text = message.content
+            break
+        if message.author.bot or message.webhook_id is not None or message.is_system() or not content:
+            continue
+        if len(content) > MAX_MESSAGE_CHARS:
+            content = content[:MAX_MESSAGE_CHARS] + " [truncated]"
+        if len(messages) < HISTORY_LIMIT:
+            messages.append({
+                "username": message.author.name,
+                "display_name": message.author.display_name,
+                "text": content,
+            })
+    if not scenario_text:
+        return None, None, 0
+    messages.reverse()
+    return scenario_text, json.dumps(messages, ensure_ascii=False), len(messages)
+
+
+class ScenarioNewsSelect(discord.ui.Select):
+    def __init__(self, stories: list[Story]):
+        options = []
+        for index, story in enumerate(stories):
+            date = story.published.date().isoformat() if story.published else "Recent"
+            options.append(discord.SelectOption(
+                label=story.title[:100], value=str(index),
+                description=f"{story.source} · {date}"[:100],
+            ))
+        super().__init__(placeholder="Choose a story", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, ScenarioNewsView):
+            return
+        if interaction.user.id != view.owner_id:
+            await interaction.response.send_message("Only the person who requested these stories can choose one.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        self.disabled = True
+        await view.bot._start_scenario(interaction, view.stories[int(self.values[0])], view.in_channel)
+        view.stop()
+
+
+class ScenarioNewsView(discord.ui.View):
+    def __init__(
+        self, bot: "RaniBot", owner_id: int, stories: list[Story], in_channel: bool,
+    ):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.stories = stories
+        self.in_channel = in_channel
+        self.add_item(ScenarioNewsSelect(stories))
 
 
 class RaniBot(discord.Client):
@@ -92,6 +173,17 @@ class RaniBot(discord.Client):
         ):
             memory_group.add_command(app_commands.Command(name=name, description=description, callback=callback))
         self.tree.add_command(memory_group)
+        scenario_group = app_commands.Group(
+            name="scenario", description="Start or deepen a grounded futurist discussion.",
+            guild_only=True,
+        )
+        for name, description, callback in (
+            ("create", "Create a scenario from a topic or curated-source article URL.", self.run_scenario_create),
+            ("news", "Choose a recent story from curated science and technology feeds.", self.run_scenario_news),
+            ("deepen", "Let one selected personality deepen the current scenario discussion.", self.run_scenario_deepen),
+        ):
+            scenario_group.add_command(app_commands.Command(name=name, description=description, callback=callback))
+        self.tree.add_command(scenario_group)
         for name, callback in (
             ("Ask Mira about this", self.message_mira),
             ("Analyze with Hex", self.message_hex),
@@ -106,10 +198,10 @@ class RaniBot(discord.Client):
             guild = discord.Object(id=self.settings.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info("Synced eight slash command roots and three message actions to test server %s", guild.id)
+            logger.info("Synced nine slash command roots and three message actions to test server %s", guild.id)
         else:
             await self.tree.sync()
-            logger.info("Synced eight slash command roots and three message actions globally")
+            logger.info("Synced nine slash command roots and three message actions globally")
 
     async def on_ready(self) -> None:
         logger.info("Ranibot connected as bot ID %s", self.user.id)
@@ -355,6 +447,185 @@ class RaniBot(discord.Client):
         finally:
             self.active_channels.discard(channel.id)
 
+    @app_commands.describe(
+        topic="A futurist topic, question, or HTTPS article from a curated source",
+        in_channel="Post here instead of creating a public thread",
+    )
+    async def run_scenario_create(
+        self, interaction: discord.Interaction,
+        topic: app_commands.Range[str, 3, 1000], in_channel: bool = False,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        topic = topic.strip()
+        if topic.startswith("https://") and " " not in topic:
+            try:
+                story = await fetch_article(topic)
+            except Exception as exc:
+                logger.warning("Could not read scenario article (%s)", type(exc).__name__)
+                await interaction.edit_original_response(
+                    content="I couldn't read that article. Use an HTTPS link from MIT News, NIH, NASA/JPL, or Nature."
+                )
+                return
+        else:
+            story = Story(title=topic, summary=f"A server member proposed this topic: {topic}")
+        await self._start_scenario(interaction, story, in_channel)
+
+    @app_commands.describe(
+        category="Limit the curated feeds to one subject",
+        in_channel="Post the selected scenario here instead of creating a public thread",
+    )
+    async def run_scenario_news(
+        self, interaction: discord.Interaction,
+        category: Literal[
+            "Any", "AI", "Biotech & longevity", "Cybernetics", "Robotics", "Space",
+            "Technology & society",
+        ] = "Any",
+        in_channel: bool = False,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            stories = await fetch_news(category)
+        except Exception as exc:
+            logger.warning("Curated news lookup failed (%s)", type(exc).__name__)
+            stories = []
+        if not stories:
+            await interaction.edit_original_response(
+                content="I couldn't retrieve any stories from the curated feeds. Try again later or use `/scenario create`."
+            )
+            return
+        view = ScenarioNewsView(self, interaction.user.id, stories, in_channel)
+        await interaction.edit_original_response(
+            content=f"Choose one recent **{category}** story. No AI request has been made yet.", view=view,
+        )
+
+    async def _start_scenario(
+        self, interaction: discord.Interaction, story: Story, in_channel: bool,
+    ) -> None:
+        channel = interaction.channel
+        if interaction.guild is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Use scenario commands in a server text channel or thread.", view=None)
+            return
+        permissions = interaction.app_permissions
+        can_send = permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages
+        if not (permissions.view_channel and can_send):
+            await interaction.edit_original_response(
+                content="I need View Channel and Send Messages (Send Messages in Threads for a thread) here.", view=None,
+            )
+            return
+        create_thread = not in_channel and isinstance(channel, discord.TextChannel)
+        if create_thread and not permissions.create_public_threads:
+            await interaction.edit_original_response(
+                content="I need Create Public Threads for the default threaded scenario. Run it again with `in_channel:True`, or update my channel permissions.",
+                view=None,
+            )
+            return
+        if channel.id in self.active_channels:
+            await interaction.edit_original_response(content="An AI request is already running in this channel.", view=None)
+            return
+
+        self.active_channels.add(channel.id)
+        try:
+            logger.info("Creating scenario from %s in channel %s", story.source, channel.id)
+            try:
+                scenario = await generate_scenario(self.llm, story)
+            except Exception as exc:
+                logger.warning("Scenario generation failed (%s)", type(exc).__name__)
+                await interaction.edit_original_response(
+                    content="I couldn't create a scenario from that source. Try again later.", view=None,
+                )
+                return
+            starter = await channel.send(
+                format_scenario(scenario, story),
+                allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=False,
+            )
+            if create_thread:
+                try:
+                    thread = await starter.create_thread(
+                        name=scenario.title.replace("\n", " ")[:100], auto_archive_duration=1440,
+                    )
+                except discord.HTTPException as exc:
+                    logger.warning("Scenario posted but thread creation failed (HTTP %s)", exc.status)
+                    await interaction.edit_original_response(
+                        content="I posted the scenario, but Discord would not create its thread. It can still be discussed in this channel.",
+                        view=None,
+                    )
+                else:
+                    await interaction.edit_original_response(
+                        content=f"Created {thread.mention}. The agents will wait for the humans to discuss it.", view=None,
+                    )
+            else:
+                await interaction.edit_original_response(
+                    content="Posted the scenario here. The agents will wait for the humans to discuss it.", view=None,
+                )
+        except discord.HTTPException as exc:
+            logger.warning("Discord scenario request failed in channel %s (HTTP %s)", channel.id, exc.status)
+            await interaction.edit_original_response(
+                content="Discord could not post the scenario. Check my channel and thread permissions.", view=None,
+            )
+        finally:
+            self.active_channels.discard(channel.id)
+
+    async def run_scenario_deepen(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel = interaction.channel
+        if interaction.guild is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Use `/scenario deepen` in a scenario channel or thread.")
+            return
+        permissions = interaction.app_permissions
+        can_send = permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages
+        if not (permissions.view_channel and permissions.read_message_history and can_send):
+            await interaction.edit_original_response(
+                content="I need View Channel, Read Message History, and permission to send here."
+            )
+            return
+        if not interaction.permissions.read_message_history:
+            await interaction.edit_original_response(content="You need Read Message History to invoke this here.")
+            return
+        if channel.id in self.active_channels:
+            await interaction.edit_original_response(content="An AI request is already running in this channel.")
+            return
+
+        bot_id = self.user.id if self.user else 0
+        scenario_text, discussion, count = await read_scenario_discussion(
+            channel, interaction.created_at, bot_id,
+        )
+        if not scenario_text:
+            await interaction.edit_original_response(
+                content="I couldn't find a recent Ranibot scenario here. Use `/scenario create` or `/scenario news` first."
+            )
+            return
+        if count < MIN_SCENARIO_DISCUSSION_MESSAGES or discussion is None:
+            await interaction.edit_original_response(
+                content=f"Let the humans discuss it first. I need at least {MIN_SCENARIO_DISCUSSION_MESSAGES} human messages after the scenario."
+            )
+            return
+
+        self.active_channels.add(channel.id)
+        try:
+            shared_memory, _ = await self._memory_context(interaction.guild.id, "Mira")
+            logger.info("Deepening scenario after %s human messages in channel %s", count, channel.id)
+            try:
+                result = await deepen_scenario(self.llm, scenario_text, discussion, shared_memory)
+            except Exception as exc:
+                logger.warning("Scenario deepening failed (%s)", type(exc).__name__)
+                await interaction.edit_original_response(content="I couldn't deepen the scenario. Try again later.")
+                return
+            await channel.send(
+                f"**{result.agent_name}:** {result.text}",
+                allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
+            )
+            await self._remember_agent_turn(
+                interaction.guild.id, channel.id, result.agent_name, result.text,
+            )
+            await interaction.edit_original_response(
+                content=f"{result.agent_name} added one perspective to the discussion."
+            )
+        except discord.HTTPException as exc:
+            logger.warning("Discord scenario deepening failed in channel %s (HTTP %s)", channel.id, exc.status)
+            await interaction.edit_original_response(content="Discord could not post the response. Check my permissions.")
+        finally:
+            self.active_channels.discard(channel.id)
+
     async def run_status(self, interaction: discord.Interaction) -> None:
         seconds = max(0, int(time.monotonic() - self.started_at))
         days, seconds = divmod(seconds, 86400)
@@ -587,9 +858,11 @@ class RaniBot(discord.Client):
             "**/agents:** reads up to 30 recent messages, removes bot/webhook/system and empty messages, then sends human usernames, display names, and text to OpenAI in **3 requests**.\n"
             "**/synthesize:** sends that same filtered recent context to OpenAI in **1 request**.\n"
             "**/ask:** sends the typed question in **1 request**; it does not read channel history. **Message actions:** send only selected text in **1 request**. If server memory is enabled, both also send saved server context and that agent's journal.\n"
-            "**Memory:** a Manage Server user can enable ambient observation. Ranibot then buffers human text from accessible server channels for at most 7 days. Each 20-message batch is sent to OpenAI in **1 request** to extract durable server-level context; processed raw text is deleted. Agent replies are retained in separate Mira, Hex, and Moss journals. Memories stay in this server's PostgreSQL scope until pruned or deleted. `/memory pause` stops observation and use; list, forget, and clear provide controls.\n"
+            "**/scenario create:** sends a typed topic in **1 request**. For an approved article URL, Ranibot first downloads that public page and sends its title, description, URL, and source to OpenAI. **/scenario news** downloads curated public RSS feeds; browsing the choices uses **0 requests**, and selecting one uses **1 request**.\n"
+            "**/scenario deepen:** reads the scenario and up to 30 recent human messages after it, then uses **1 request** to select Mira, Hex, or Moss and write one reply. Enabled shared server memory may also be included.\n"
+            "**Memory:** when enabled by Manage Server, Ranibot buffers accessible human text for at most 7 days. Each 20-message batch uses **1 request** to extract server context; processed raw text is deleted. Server notes and bounded agent journals remain in this server's PostgreSQL scope. Pause, list, forget, and clear provide controls.\n"
             "**/status, /help, /consent, /chesslab, and memory controls:** make **0 AI requests**.\n\n"
-            "Ranibot never downloads attachments, opens links, browses, or accesses your computer. Generated replies are public; controls and status are private. Provider requests use `store=False`, but OpenAI may retain data under its policies. AI output and extracted memories can be wrong. Tell members before enabling memory, avoid secrets, and remember that AI features use the bot owner's paid API account.",
+            "Ranibot never downloads attachments or accesses your computer. It fetches approved public sources only for scenario commands and never posts automatically. Output is public. Requests use `store=False`, but provider retention policies still apply. Avoid secrets; AI features use the bot owner's paid API account.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 
@@ -601,11 +874,14 @@ class RaniBot(discord.Client):
             "**/status** — Shows uptime and the configured model; makes no AI request.\n"
             "**/chesslab** — Publicly shares the Chess Lab link and introduction; no game access or AI request.\n"
             "**/synthesize** — Sends recent filtered human chat in one AI request and publicly maps common ground, tensions, open questions, and a possible next step.\n"
+            "**/scenario create** — Creates a grounded futurist prompt from a topic or approved article; starts a public thread by default.\n"
+            "**/scenario news** — Privately offers recent stories from curated science and technology feeds; choosing one creates a scenario.\n"
+            "**/scenario deepen** — After at least two human replies, selects Mira, Hex, or Moss to add one useful perspective in one AI request.\n"
             "**/memory status|enable|pause|list|forget|clear** — Controls transparent per-server memory. Enable, pause, forget, and clear require Manage Server.\n"
             "**/consent** — Privately explains exactly what Ranibot reads, sends, stores, and costs; no AI request.\n"
             "**/help** — Shows this private guide; makes no AI request.\n"
             "**Message actions** — Right-click a message → Apps to ask one personality about that selected text.\n\n"
-            "**Privacy and cost:** AI commands use the bot owner's paid OpenAI account. When memory is enabled, Ranibot observes human messages in channels it can access, sends each 20-message batch to OpenAI for extraction, stores concise server memories and agent journals, and supplies them to future agent requests. Raw processed batches are deleted. Use `/consent` for the complete data flow. Avoid secrets and tell members before enabling memory. Ranibot has no access to your computer and does not open links. AI replies and memories can be wrong.",
+            "**Privacy and cost:** AI commands use the bot owner's paid OpenAI account. Scenario creation and deepening each use one request; news choices come from approved public feeds. When memory is enabled, Ranibot observes accessible human chat and stores bounded server memories and agent journals. Use `/consent` for the complete data flow. Ranibot has no access to your computer. AI output can be wrong.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 

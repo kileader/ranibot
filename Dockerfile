@@ -10,7 +10,7 @@ COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # Copy only application code; credentials are supplied at runtime.
-COPY bot.py agents.py llm.py config.py memory.py ./
+COPY bot.py agents.py llm.py config.py memory.py scenarios.py ./
 
 USER 10001:10001
 CMD ["python", "bot.py"]

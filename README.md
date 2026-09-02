@@ -9,6 +9,12 @@ experiment where one bot account hosts three AI personalities:
 
 Normal conversation → `/agents` → three independent decisions → zero to three labeled replies.
 
+Ranibot can also start grounded futurist discussions from a member's topic or a
+curated current article. Scenarios mix plausible forecasting with ethical and
+policy questions. They open in public threads by default; the human participants
+talk first, and `/scenario deepen` later selects one personality to add a useful
+complication or perspective.
+
 The bot fetches the latest **30 channel messages before the command was invoked**, excludes bots, webhooks, system messages, and empty text, then gives each agent the same chronological human transcript. This can mean fewer than 30 human messages. It includes usernames, display names, and text, with each message limited to 1,500 characters. It doesn't download attachments or open links.
 
 Each agent makes one LLM call that returns either a short contribution or `SILENT`. All three calls run concurrently; contributions are posted in Mira/Hex/Moss order. Silence produces no public message. Status and errors are private to whoever ran the command. AI slash commands and message actions permit only one active run per channel, within this bot process.
@@ -37,6 +43,9 @@ behavior remains intact.
 | `/status` | Shows process uptime, Discord heartbeat latency, and configured model | 0 | None; private response |
 | `/chesslab` | Shares the Chess Lab app link and a short introduction | 0 | One message with the app link |
 | `/synthesize` | Maps recent common ground, tensions, open questions, and a possible next step | 1 when there is readable human text | One compact synthesis if the discussion supports it |
+| `/scenario create topic [in_channel]` | Creates a grounded scenario from a topic or approved article URL; a public thread is the default | 1 after valid input | One scenario and normally a discussion thread |
+| `/scenario news [category] [in_channel]` | Offers five recent stories from curated institutional feeds | 0 while choosing; 1 after a story is selected | One selected scenario and normally a thread |
+| `/scenario deepen` | Reads the current scenario discussion and selects one personality to add value | 1 after at least two human messages | One Mira, Hex, or Moss reply |
 | `/consent` | Explains what Ranibot reads, sends, stores, and costs | 0 | None; private response |
 | `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
 | `/memory ...` | Inspects, enables, pauses, forgets, or clears per-server memory | 0, except background extraction after each 20 buffered messages | None; private response |
@@ -93,6 +102,31 @@ inference and uncertainty, and can decline when the discussion is too thin. Its
 result is public and capped at 1,500 characters. `/consent` is a private, fixed
 explanation of data flow and cost; it neither reads history nor calls OpenAI.
 
+### Futurist scenarios
+
+`/scenario create` accepts either a topic or one HTTPS article from the approved
+MIT News, NIH, NASA/JPL, or Nature domains. For an article, Ranibot downloads only
+the public page, extracts its title and description, and supplies that source
+material to one AI request. The prompt requires a clear boundary between the
+reported present and plausible speculation. Ranibot does not treat model memory as
+current news.
+
+`/scenario news` fetches official RSS feeds covering AI, biotechnology and
+longevity, cybernetics, robotics, space, and technology's relationship with
+society. The choices are private and make no AI request. Selecting a story makes
+one scenario request and retains a visible source link. Sources can fail or publish
+off-topic items; Ranibot applies a small relevance filter but does not claim to be
+a comprehensive news service.
+
+By default, a scenario is posted in the current text channel and a public thread is
+created from it. Set `in_channel:True` to skip the thread. After at least two human
+messages, `/scenario deepen` reads the scenario and up to 30 recent human messages,
+filters out bots, webhooks, systems, and empty text, then makes one request that
+selects Mira, Hex, or Moss and writes one short contribution. The other personalities
+do not respond. If server memory is enabled, bounded shared server memory may be
+included, and the resulting personality turn is added to its journal. Ranibot never
+starts scenarios on a schedule.
+
 `/chesslab` posts a fixed introduction and a link to
 [Chess Lab](https://chess-lab-zeta.vercel.app). It does not read channel history,
 call AI, fetch the website, link accounts, or access anyone's games. The response
@@ -100,7 +134,7 @@ is public, with mentions and link previews suppressed. Chess Lab sign-in happens
 on the website, and game libraries remain private. No new configuration or
 permissions are required.
 
-All eight command roots follow `DISCORD_GUILD_ID`: a configured test server receives the
+All nine command roots follow `DISCORD_GUILD_ID`: a configured test server receives the
 commands immediately; leaving it blank registers them globally on startup.
 
 ## Windows PowerShell setup
@@ -121,7 +155,7 @@ On the **Bot** page, under **Privileged Gateway Intents**, enable **Message Cont
 
 1. On the application's **Installation** page, enable **Guild Install** (server installation); user installation isn't needed.
 2. Under **Default Install Settings → Guild Install**, select scopes **`bot`** and **`applications.commands`**.
-3. Grant **View Channels**, **Read Message History**, and **Send Messages**. Also grant **Send Messages in Threads** if you want to test in threads. Don't grant Administrator.
+3. Grant **View Channels**, **Read Message History**, **Send Messages**, **Create Public Threads**, and **Send Messages in Threads**. Don't grant Administrator. If you omit Create Public Threads, scenario commands still work with `in_channel:True`.
 4. Open the generated install link and add the app to your test server. If the portal offers the OAuth2 URL Generator instead, select those same scopes and permissions there.
 5. Check channel permission overrides: the bot needs access in the actual test channel. Your own account needs **Use Application Commands** and **Read Message History**. Start with a normal text channel; private or locked threads may require additional access.
 
@@ -153,9 +187,9 @@ DISCORD_GUILD_ID=your_numeric_test_server_id
 DATABASE_URL=your_postgresql_connection_string
 ```
 
-Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/synthesize` sends one request with the same filtered context, and `/ask` sends one request to its selected agent. No automatic retries are configured.
+Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/synthesize`, `/ask`, scenario creation, and `/scenario deepen` each send one request when their input is valid. Browsing `/scenario news` choices sends no AI request. No automatic retries are configured.
 
-`DISCORD_GUILD_ID` is optional: when set, all eight command roots are synced only to
+`DISCORD_GUILD_ID` is optional: when set, all nine command roots are synced only to
 that server. Blank means global registration. `DATABASE_URL` is optional for a local
 memory-free run; `/memory enable` requires PostgreSQL. Existing environment variables
 take precedence over `.env`. Restart the bot after configuration changes.
@@ -299,12 +333,14 @@ Tests use fake Discord messages/interactions and a fake LLM, plus a mocked OpenA
 
 | File | Responsibility |
 | --- | --- |
-| `bot.py` | Discord connection, eight command roots, message observation, memory controls, and labeled posting |
+| `bot.py` | Discord connection, nine command roots, message observation, memory controls, and labeled posting |
 | `agents.py` | Agent dataclass, personalities, silence parsing, independent calls |
 | `llm.py` | Async provider interface and OpenAI adapter |
 | `config.py` | Validated `.env` configuration |
 | `memory.py` | PostgreSQL schema/store, bounded buffers, and server-memory extraction |
+| `scenarios.py` | Grounded scenario prompts, safe source allowlist, RSS parsing, and personality selection |
 | `tests/test_ranibot.py` | Offline workflow checks |
+| `tests/test_scenarios.py` | Scenario parsing, source, thread, permission, and deepening checks |
 
 To change personalities, edit `AGENTS` in `agents.py`. To add another provider later, implement `generate(system_prompt, context)` and `close()` in `llm.py`, then update its factory and configuration validation. Only `openai` works today; setting a different provider name does not magically add compatibility. The adapter uses the [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text?api-mode=responses). The [default model's documentation](https://developers.openai.com/api/docs/models/gpt-5.6-luna) lists supported endpoints. Ranibot explicitly uses `reasoning.effort: none` so its 400-token output cap is reserved for the short visible answer; other models may support different reasoning values, and account availability can vary.
 
@@ -318,7 +354,10 @@ from all server channels it can access and sends each 20-message batch to OpenAI
 one extraction request. Processed raw batches are deleted and unprocessed buffered
 messages expire after seven days; extracted server notes
 and bounded personality journals remain in PostgreSQL until pruned or deleted.
-Memory controls themselves make no AI requests. The bot logs counts and error types,
+Scenario article creation downloads only approved public pages; the news picker reads
+curated public RSS feeds. Scenario deepening sends the source scenario, filtered human
+discussion, and optionally shared server memory in one request. No scheduled fetch or
+post loop exists. Memory controls themselves make no AI requests. The bot logs counts and error types,
 not message bodies, database URLs, or API keys. `store=False` disables Responses
 application-state storage, but does **not** guarantee zero provider retention; provider
 policies still apply. See [OpenAI data controls](https://platform.openai.com/docs/guides/your-data).
@@ -328,8 +367,8 @@ Conversation and memory are separated from system instructions, and agents have 
 tools or secrets in their prompts, but output and extracted memories can still be
 mistaken or manipulated. Anyone who can invoke AI features, and anyone who posts in
 an enabled server, can contribute to API usage. Restrict the bot to trusted servers;
-there is no persistent rate limiter. The bot does not autonomously post, browse, or
-use system tools.
+there is no persistent rate limiter. The bot does not autonomously post, perform
+general web browsing, or use system tools.
 
 ## Troubleshooting
 
