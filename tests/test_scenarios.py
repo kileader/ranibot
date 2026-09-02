@@ -17,6 +17,7 @@ from scenarios import (
     Story,
     StorySelection,
     article_url_allowed,
+    balance_stories_by_source,
     deepen_scenario,
     format_scenario,
     format_relevant_story,
@@ -117,9 +118,13 @@ class ScenarioLogicTests(unittest.IsolatedAsyncioTestCase):
     def test_curated_url_allowlist_rejects_ports_credentials_and_other_hosts(self):
         self.assertTrue(article_url_allowed("https://news.mit.edu/2026/example"))
         self.assertTrue(article_url_allowed("https://www.nature.com/articles/example"))
+        self.assertTrue(article_url_allowed("https://openai.com/news/example"))
+        self.assertTrue(article_url_allowed("https://huggingface.co/blog/example"))
+        self.assertTrue(article_url_allowed("https://arstechnica.com/ai/2026/example"))
         self.assertFalse(article_url_allowed("http://news.mit.edu/example"))
         self.assertFalse(article_url_allowed("https://news.mit.edu:8443/example"))
         self.assertFalse(article_url_allowed("https://user@news.mit.edu/example"))
+        self.assertFalse(article_url_allowed("https://techcrunch.com/2026/example"))
         self.assertFalse(article_url_allowed("https://example.com/news"))
 
     def test_rss_and_atom_entries_are_parsed_without_html(self):
@@ -132,6 +137,22 @@ class ScenarioLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stories[0].title, "New AI system & useful")
         self.assertEqual(stories[0].summary, "Summary")
         self.assertEqual(stories[0].published.year, 2026)
+
+    def test_news_candidates_are_balanced_across_sources(self):
+        stories = [
+            Story("Fast 1", source="Fast source"),
+            Story("Fast 2", source="Fast source"),
+            Story("Fast 3", source="Fast source"),
+            Story("Slow 1", source="Slow source"),
+            Story("Third 1", source="Third source"),
+        ]
+
+        balanced = balance_stories_by_source(stories, 4)
+
+        self.assertEqual(
+            [story.title for story in balanced],
+            ["Fast 1", "Slow 1", "Third 1", "Fast 2"],
+        )
 
 
 class ScenarioDiscordTests(unittest.IsolatedAsyncioTestCase):

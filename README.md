@@ -105,16 +105,19 @@ explanation of data flow and cost; it neither reads history nor calls OpenAI.
 
 ### Futurist scenarios
 
-`/scenario create` accepts either a topic or one HTTPS article from the approved
-MIT News, NIH, NASA/JPL, or Nature domains. For an article, Ranibot downloads only
+`/scenario create` accepts either a topic or one HTTPS article from Ranibot's
+approved news domains. For an article, Ranibot downloads only
 the public page, extracts its title and description, and supplies that source
 material to one AI request. The prompt requires a clear boundary between the
 reported present and plausible speculation. Ranibot does not treat model memory as
 current news.
 
-`/scenario news` fetches official RSS feeds covering AI, biotechnology and
+`/scenario news` fetches curated RSS feeds covering AI, biotechnology and
 longevity, cybernetics, robotics, space, and technology's relationship with
-society. The choices are private and make no AI request. Selecting a story makes
+society. AI sources include OpenAI News, Hugging Face Blog, Ars Technica AI, and
+MIT News; other categories use MIT News, NIH, and Nature. Results are balanced
+across publishers so a fast feed does not fill every slot. The choices are private
+and make no AI request. Selecting a story makes
 one scenario request and retains a visible source link. Sources can fail or publish
 off-topic items; Ranibot applies a small relevance filter but does not claim to be
 a comprehensive news service.

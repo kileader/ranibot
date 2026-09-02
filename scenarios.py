@@ -21,6 +21,7 @@ from llm import LLM
 logger = logging.getLogger(__name__)
 SCENARIO_TIMEOUT_SECONDS = 40
 MAX_DOWNLOAD_BYTES = 750_000
+MAX_FEED_DOWNLOAD_BYTES = 2_000_000
 MAX_SOURCE_SUMMARY_CHARS = 2_000
 MAX_SCENARIO_CHARS = 1_200
 MAX_DEEPEN_CHARS = 800
@@ -41,6 +42,9 @@ class Feed:
 
 
 FEEDS = (
+    Feed("AI", "OpenAI News", "https://openai.com/news/rss.xml"),
+    Feed("AI", "Hugging Face Blog", "https://huggingface.co/blog/feed.xml"),
+    Feed("AI", "Ars Technica AI", "https://arstechnica.com/ai/feed/"),
     Feed("AI", "MIT News", "https://news.mit.edu/topic/mitartificial-intelligence2-rss.xml"),
     Feed("Biotech & longevity", "NIH News Releases", "https://www.nih.gov/news-releases/feed.xml"),
     Feed("Biotech & longevity", "Nature", "https://www.nature.com/subjects/ageing.rss"),
@@ -52,7 +56,11 @@ FEEDS = (
 )
 
 CATEGORY_KEYWORDS = {
-    "AI": (" ai ", "artificial intelligence", "machine learning", "language model", "algorithm", "neural network"),
+    "AI": (
+        " ai ", "artificial intelligence", "machine learning", "language model",
+        " llm", "model", "algorithm", "neural network", "inference", "compute",
+        "gpu", "agent", "alignment", "jailbreak", "open source", "open-source",
+    ),
     "Biotech & longevity": ("ageing", "aging", "longevity", "healthspan", "lifespan", "gene", "genetic", "organoid", "biotech", "bioengineering", "cell", "tissue", "therapy"),
     "Cybernetics": ("brain", "neural", "neuro", "cognition", "consciousness", "prosthetic", "implant", "interface", "augmentation", "bionic", "sensory"),
     "Robotics": ("robot", "autonomous", "automation", "drone", "prosthetic", "humanoid"),
@@ -61,7 +69,8 @@ CATEGORY_KEYWORDS = {
 }
 
 ALLOWED_ARTICLE_DOMAINS = (
-    "jpl.nasa.gov", "nasa.gov", "nature.com", "news.mit.edu", "nih.gov",
+    "arstechnica.com", "huggingface.co", "jpl.nasa.gov", "nasa.gov",
+    "nature.com", "news.mit.edu", "nih.gov", "openai.com",
 )
 
 
@@ -329,7 +338,9 @@ class _MetadataParser(HTMLParser):
             self.title += data
 
 
-async def _download(session: aiohttp.ClientSession, url: str) -> tuple[bytes, str]:
+async def _download(
+    session: aiohttp.ClientSession, url: str, max_bytes: int = MAX_DOWNLOAD_BYTES,
+) -> tuple[bytes, str]:
     current = url
     for _ in range(4):
         if not article_url_allowed(current):
@@ -345,7 +356,7 @@ async def _download(session: aiohttp.ClientSession, url: str) -> tuple[bytes, st
             data = bytearray()
             async for chunk in response.content.iter_chunked(64 * 1024):
                 data.extend(chunk)
-                if len(data) > MAX_DOWNLOAD_BYTES:
+                if len(data) > max_bytes:
                     raise ValueError("Source document is too large.")
             return bytes(data), current
     raise RuntimeError("Source redirected too many times.")
@@ -353,7 +364,9 @@ async def _download(session: aiohttp.ClientSession, url: str) -> tuple[bytes, st
 
 async def fetch_article(url: str) -> Story:
     if not article_url_allowed(url):
-        raise ValueError("Use an HTTPS article from MIT News, NIH, NASA/JPL, or Nature.")
+        raise ValueError(
+            "Use an HTTPS article from one of Ranibot's curated news domains."
+        )
     timeout = aiohttp.ClientTimeout(total=12)
     headers = {"User-Agent": "Ranibot/0.1 (+Discord discussion bot)"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -430,6 +443,24 @@ def parse_feed(data: bytes, feed: Feed) -> list[Story]:
     return stories
 
 
+def balance_stories_by_source(stories: Iterable[Story], limit: int) -> list[Story]:
+    """Keep high-volume publishers from crowding out every other source."""
+    groups: dict[str, list[Story]] = {}
+    for story in stories:
+        groups.setdefault(story.source, []).append(story)
+
+    balanced = []
+    while groups and len(balanced) < limit:
+        for source in tuple(groups):
+            source_stories = groups[source]
+            balanced.append(source_stories.pop(0))
+            if not source_stories:
+                del groups[source]
+            if len(balanced) == limit:
+                break
+    return balanced
+
+
 async def fetch_news(category: Category = "Any", limit: int = 5) -> list[Story]:
     selected = [feed for feed in FEEDS if category == "Any" or feed.category == category]
     selected = list({feed.url: feed for feed in selected}.values())
@@ -437,7 +468,8 @@ async def fetch_news(category: Category = "Any", limit: int = 5) -> list[Story]:
     headers = {"User-Agent": "Ranibot/0.1 (+Discord discussion bot)"}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         results = await asyncio.gather(
-            *(_download(session, feed.url) for feed in selected), return_exceptions=True,
+            *(_download(session, feed.url, MAX_FEED_DOWNLOAD_BYTES) for feed in selected),
+            return_exceptions=True,
         )
     stories = []
     for feed, result in zip(selected, results):
@@ -451,4 +483,7 @@ async def fetch_news(category: Category = "Any", limit: int = 5) -> list[Story]:
             logger.warning("Could not parse %s feed (%s)", feed.name, type(exc).__name__)
     unique = {story.url: story for story in stories if story.url}
     epoch = datetime.min.replace(tzinfo=timezone.utc)
-    return sorted(unique.values(), key=lambda item: item.published or epoch, reverse=True)[:limit]
+    newest_first = sorted(
+        unique.values(), key=lambda item: item.published or epoch, reverse=True,
+    )
+    return balance_stories_by_source(newest_first, limit)
