@@ -10,17 +10,22 @@ from bot import RaniBot, read_scenario_discussion
 from config import Settings
 from scenarios import (
     DEEPEN_PROMPT,
+    RELEVANT_NEWS_PROMPT,
     SCENARIO_PROMPT,
     Feed,
     Scenario,
     Story,
+    StorySelection,
     article_url_allowed,
     deepen_scenario,
     format_scenario,
+    format_relevant_story,
     generate_scenario,
     parse_deepening,
     parse_feed,
     parse_scenario,
+    parse_story_selection,
+    select_relevant_story,
 )
 
 
@@ -72,6 +77,27 @@ class ScenarioLogicTests(unittest.IsolatedAsyncioTestCase):
         deepen_input = json.loads(llm.calls[1][1])
         self.assertEqual(deepen_input["human_discussion"][0]["text"], "Regulate it.")
 
+    async def test_relevant_story_selection_can_match_or_decline(self):
+        stories = [
+            Story("Robot labor study", "https://news.mit.edu/robot", "Researchers measured workplace effects.", "MIT News", "Robotics"),
+            Story("Venus chemistry", "https://news.mit.edu/venus", "Peptides formed in a harsh environment.", "MIT News", "Space"),
+        ]
+        llm = StubLLM('{"story_index":0,"reason":"This gives the discussion a concrete labor study to examine."}')
+        result = await select_relevant_story(llm, ["Will robots change bargaining power?"], stories)
+        self.assertEqual(result, StorySelection(0, "This gives the discussion a concrete labor study to examine."))
+        self.assertEqual(llm.calls[0][0], RELEVANT_NEWS_PROMPT)
+        sent = json.loads(llm.calls[0][1])
+        self.assertEqual(sent["human_discussion"], ["Will robots change bargaining power?"])
+        self.assertNotIn("url", sent["candidate_stories"][0])
+
+        llm.reply = '{"story_index":null,"reason":""}'
+        self.assertEqual(
+            await select_relevant_story(llm, ["What should we order for dinner?"], stories),
+            StorySelection(None),
+        )
+        with self.assertRaises(ValueError):
+            parse_story_selection('{"story_index":5,"reason":"No."}', len(stories))
+
     def test_format_keeps_source_visible_and_mentions_inert_at_transport(self):
         output = format_scenario(
             Scenario("Memory markets", "A real trial exists. Suppose it scales.", "Who benefits?"),
@@ -81,6 +107,12 @@ class ScenarioLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**Question:** Who benefits?", output)
         self.assertIn("https://news.mit.edu/example", output)
         self.assertLess(len(output), 2000)
+        relevant = format_relevant_story(
+            Story("Robot [labor]", "https://news.mit.edu/robot", source="MIT News"),
+            "It directly examines the labor question under discussion.",
+        )
+        self.assertIn("**Relevant news:**", relevant)
+        self.assertIn("https://news.mit.edu/robot", relevant)
 
     def test_curated_url_allowlist_rejects_ports_credentials_and_other_hosts(self):
         self.assertTrue(article_url_allowed("https://news.mit.edu/2026/example"))
@@ -218,4 +250,40 @@ class ScenarioDiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(channel.send.call_args.args[0].startswith("**Hex:**"))
         self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
         self.assertFalse(bot.active_channels)
+        await bot.close()
+
+    async def test_relevant_news_posts_one_match_and_can_decline(self):
+        llm = StubLLM("unused")
+        bot = RaniBot(Settings("unused", "unused"), llm)
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 42
+        channel.send = AsyncMock()
+        interaction = self.make_interaction(channel)
+        context = json.dumps([{
+            "username": "a", "display_name": "A", "text": "How will robots affect labor?",
+        }])
+        story = Story(
+            "Robot labor study", "https://news.mit.edu/robot", "A workplace study.",
+            "MIT News", "Robotics",
+        )
+
+        with patch("bot.read_context", AsyncMock(return_value=context)), patch(
+            "bot.fetch_news", AsyncMock(return_value=[story])
+        ), patch("bot.select_relevant_story", AsyncMock(
+            return_value=StorySelection(0, "It examines the labor question directly.")
+        )):
+            await bot.run_scenario_relevant(interaction)
+
+        channel.send.assert_awaited_once()
+        self.assertIn("Robot", channel.send.call_args.args[0])
+        self.assertEqual(channel.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
+
+        channel.send.reset_mock()
+        interaction = self.make_interaction(channel)
+        with patch("bot.read_context", AsyncMock(return_value=context)), patch(
+            "bot.fetch_news", AsyncMock(return_value=[story])
+        ), patch("bot.select_relevant_story", AsyncMock(return_value=StorySelection(None))):
+            await bot.run_scenario_relevant(interaction)
+        channel.send.assert_not_awaited()
+        self.assertIn("strong enough connection", interaction.edit_original_response.call_args.kwargs["content"])
         await bot.close()

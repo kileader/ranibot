@@ -45,6 +45,7 @@ behavior remains intact.
 | `/synthesize` | Maps recent common ground, tensions, open questions, and a possible next step | 1 when there is readable human text | One compact synthesis if the discussion supports it |
 | `/scenario create topic [in_channel]` | Creates a grounded scenario from a topic or approved article URL; a public thread is the default | 1 after valid input | One scenario and normally a discussion thread |
 | `/scenario news [category] [in_channel]` | Offers five recent stories from curated institutional feeds | 0 while choosing; 1 after a story is selected | One selected scenario and normally a thread |
+| `/scenario relevant` | Matches recent human discussion against curated stories and declines weak matches | 1 when there is readable discussion and news | One linked article or no public output |
 | `/scenario deepen` | Reads the current scenario discussion and selects one personality to add value | 1 after at least two human messages | One Mira, Hex, or Moss reply |
 | `/consent` | Explains what Ranibot reads, sends, stores, and costs | 0 | None; private response |
 | `/help` | Explains these commands and their privacy/cost behavior | 0 | None; private response |
@@ -118,6 +119,12 @@ one scenario request and retains a visible source link. Sources can fail or publ
 off-topic items; Ranibot applies a small relevance filter but does not claim to be
 a comprehensive news service.
 
+`/scenario relevant` reads up to 30 recent human messages, strips the usernames,
+and compares that text with up to 24 recent candidate titles and short feed
+summaries in one AI request. It posts one linked article with a one-sentence reason
+only when the connection is specific enough; otherwise it responds privately that
+no strong match was found. It does not generate a scenario or create a thread.
+
 By default, a scenario is posted in the current text channel and a public thread is
 created from it. Set `in_channel:True` to skip the thread. After at least two human
 messages, `/scenario deepen` reads the scenario and up to 30 recent human messages,
@@ -187,7 +194,7 @@ DISCORD_GUILD_ID=your_numeric_test_server_id
 DATABASE_URL=your_postgresql_connection_string
 ```
 
-Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/synthesize`, `/ask`, scenario creation, and `/scenario deepen` each send one request when their input is valid. Browsing `/scenario news` choices sends no AI request. No automatic retries are configured.
+Create an API key in the [OpenAI API dashboard](https://platform.openai.com/api-keys). Configure API billing/usage limits as appropriate. Each nonempty `/agents` invocation sends three requests, even if every agent chooses silence; `/synthesize`, `/ask`, scenario creation, `/scenario relevant`, and `/scenario deepen` each send one request when their input is valid. Browsing `/scenario news` choices sends no AI request. No automatic retries are configured.
 
 `DISCORD_GUILD_ID` is optional: when set, all nine command roots are synced only to
 that server. Blank means global registration. `DATABASE_URL` is optional for a local
@@ -354,8 +361,9 @@ from all server channels it can access and sends each 20-message batch to OpenAI
 one extraction request. Processed raw batches are deleted and unprocessed buffered
 messages expire after seven days; extracted server notes
 and bounded personality journals remain in PostgreSQL until pruned or deleted.
-Scenario article creation downloads only approved public pages; the news picker reads
-curated public RSS feeds. Scenario deepening sends the source scenario, filtered human
+Scenario article creation downloads only approved public pages; news commands read
+curated public RSS feeds. Relevant-news matching sends filtered human text plus
+candidate feed metadata in one request. Scenario deepening sends the source scenario, filtered human
 discussion, and optionally shared server memory in one request. No scheduled fetch or
 post loop exists. Memory controls themselves make no AI requests. The bot logs counts and error types,
 not message bodies, database URLs, or API keys. `store=False` disables Responses

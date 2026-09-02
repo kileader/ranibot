@@ -27,8 +27,10 @@ from scenarios import (
     deepen_scenario,
     fetch_article,
     fetch_news,
+    format_relevant_story,
     format_scenario,
     generate_scenario,
+    select_relevant_story,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,6 +182,7 @@ class RaniBot(discord.Client):
         for name, description, callback in (
             ("create", "Create a scenario from a topic or curated-source article URL.", self.run_scenario_create),
             ("news", "Choose a recent story from curated science and technology feeds.", self.run_scenario_news),
+            ("relevant", "Share one recent story relevant to the current discussion.", self.run_scenario_relevant),
             ("deepen", "Let one selected personality deepen the current scenario discussion.", self.run_scenario_deepen),
         ):
             scenario_group.add_command(app_commands.Command(name=name, description=description, callback=callback))
@@ -565,6 +568,67 @@ class RaniBot(discord.Client):
         finally:
             self.active_channels.discard(channel.id)
 
+    async def run_scenario_relevant(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel = interaction.channel
+        if interaction.guild is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Use `/scenario relevant` in a server text channel or thread.")
+            return
+        permissions = interaction.app_permissions
+        can_send = permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages
+        if not (permissions.view_channel and permissions.read_message_history and can_send):
+            await interaction.edit_original_response(
+                content="I need View Channel, Read Message History, and permission to send here."
+            )
+            return
+        if not interaction.permissions.read_message_history:
+            await interaction.edit_original_response(content="You need Read Message History to invoke this here.")
+            return
+        if channel.id in self.active_channels:
+            await interaction.edit_original_response(content="An AI request is already running in this channel.")
+            return
+
+        self.active_channels.add(channel.id)
+        try:
+            context = await read_context(channel, before=interaction.created_at)
+            if context is None:
+                await interaction.edit_original_response(content="There is no recent human discussion to match with news.")
+                return
+            discussion = [message["text"] for message in json.loads(context)]
+            stories = await fetch_news("Any", limit=24)
+            if not stories:
+                await interaction.edit_original_response(content="The curated feeds are unavailable right now. Try again later.")
+                return
+            logger.info(
+                "Matching %s human messages against %s news candidates in channel %s",
+                len(discussion), len(stories), channel.id,
+            )
+            try:
+                selection = await select_relevant_story(self.llm, discussion, stories)
+            except Exception as exc:
+                logger.warning("Relevant-news selection failed (%s)", type(exc).__name__)
+                await interaction.edit_original_response(content="I couldn't compare the discussion with recent news. Try again later.")
+                return
+            if selection.index is None:
+                await interaction.edit_original_response(
+                    content="I didn't find a recent story with a strong enough connection to this discussion."
+                )
+                return
+            story = stories[selection.index]
+            await channel.send(
+                format_relevant_story(story, selection.reason),
+                allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=False,
+            )
+            await interaction.edit_original_response(content="Shared one relevant story in the channel.")
+        except discord.HTTPException as exc:
+            logger.warning("Discord relevant-news request failed in channel %s (HTTP %s)", channel.id, exc.status)
+            await interaction.edit_original_response(content="Discord could not post the story. Check my permissions.")
+        except Exception as exc:
+            logger.warning("Relevant-news lookup failed (%s)", type(exc).__name__)
+            await interaction.edit_original_response(content="The curated feeds are unavailable right now. Try again later.")
+        finally:
+            self.active_channels.discard(channel.id)
+
     async def run_scenario_deepen(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         channel = interaction.channel
@@ -855,12 +919,10 @@ class RaniBot(discord.Client):
     async def run_consent(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "**Ranibot data and cost guide**\n"
-            "**/agents:** reads up to 30 recent messages, removes bot/webhook/system and empty messages, then sends human usernames, display names, and text to OpenAI in **3 requests**.\n"
-            "**/synthesize:** sends that same filtered recent context to OpenAI in **1 request**.\n"
-            "**/ask:** sends the typed question in **1 request**; it does not read channel history. **Message actions:** send only selected text in **1 request**. If server memory is enabled, both also send saved server context and that agent's journal.\n"
-            "**/scenario create:** sends a typed topic in **1 request**. For an approved article URL, Ranibot first downloads that public page and sends its title, description, URL, and source to OpenAI. **/scenario news** downloads curated public RSS feeds; browsing the choices uses **0 requests**, and selecting one uses **1 request**.\n"
-            "**/scenario deepen:** reads the scenario and up to 30 recent human messages after it, then uses **1 request** to select Mira, Hex, or Moss and write one reply. Enabled shared server memory may also be included.\n"
-            "**Memory:** when enabled by Manage Server, Ranibot buffers accessible human text for at most 7 days. Each 20-message batch uses **1 request** to extract server context; processed raw text is deleted. Server notes and bounded agent journals remain in this server's PostgreSQL scope. Pause, list, forget, and clear provide controls.\n"
+            "**/agents:** sends up to 30 filtered human messages, usernames, and display names to OpenAI in **3 requests**. **/synthesize** sends the same context in **1 request**.\n"
+            "**/ask** sends its question in **1 request**; message actions send only selected text in **1 request**. Enabled memory may be included.\n"
+            "**Scenario create/news:** create uses **1 request** and can download an approved public article's title and description. News browsing uses **0 requests** and selection uses **1 request**. **/scenario relevant** sends up to 30 recent human texts plus candidate titles and summaries in **1 request**, then shares one match or declines. **/scenario deepen** sends the scenario and up to 30 recent human messages in **1 request** to select one personality.\n"
+            "**Memory:** when enabled by Manage Server, Ranibot buffers accessible human text for at most 7 days. Each 20-message batch uses **1 request**; processed raw text is deleted. Bounded server notes and agent journals remain in this server's PostgreSQL scope. Pause, list, forget, and clear provide controls.\n"
             "**/status, /help, /consent, /chesslab, and memory controls:** make **0 AI requests**.\n\n"
             "Ranibot never downloads attachments or accesses your computer. It fetches approved public sources only for scenario commands and never posts automatically. Output is public. Requests use `store=False`, but provider retention policies still apply. Avoid secrets; AI features use the bot owner's paid API account.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
@@ -876,12 +938,13 @@ class RaniBot(discord.Client):
             "**/synthesize** — Sends recent filtered human chat in one AI request and publicly maps common ground, tensions, open questions, and a possible next step.\n"
             "**/scenario create** — Creates a grounded futurist prompt from a topic or approved article; starts a public thread by default.\n"
             "**/scenario news** — Privately offers recent stories from curated science and technology feeds; choosing one creates a scenario.\n"
+            "**/scenario relevant** — Reads recent human chat and shares one meaningfully related curated story, or declines.\n"
             "**/scenario deepen** — After at least two human replies, selects Mira, Hex, or Moss to add one useful perspective in one AI request.\n"
             "**/memory status|enable|pause|list|forget|clear** — Controls transparent per-server memory. Enable, pause, forget, and clear require Manage Server.\n"
             "**/consent** — Privately explains exactly what Ranibot reads, sends, stores, and costs; no AI request.\n"
             "**/help** — Shows this private guide; makes no AI request.\n"
             "**Message actions** — Right-click a message → Apps to ask one personality about that selected text.\n\n"
-            "**Privacy and cost:** AI commands use the bot owner's paid OpenAI account. Scenario creation and deepening each use one request; news choices come from approved public feeds. When memory is enabled, Ranibot observes accessible human chat and stores bounded server memories and agent journals. Use `/consent` for the complete data flow. Ranibot has no access to your computer. AI output can be wrong.",
+            "**Privacy and cost:** AI commands use the bot owner's paid OpenAI account. News comes from approved public feeds. Enabled memory observes accessible human chat and stores bounded server memories and agent journals. Use `/consent` for details. Ranibot cannot access your computer. AI output can be wrong.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True,
         )
 

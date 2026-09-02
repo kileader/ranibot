@@ -171,7 +171,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 scenario = bot.tree.get_command("scenario")
                 self.assertEqual(
                     {command.name for command in scenario.commands},
-                    {"create", "news", "deepen"},
+                    {"create", "news", "relevant", "deepen"},
                 )
                 self.assertTrue(all(c.guild_only for c in slash))
                 ask_options = bot.tree.get_command("ask").to_dict(bot.tree)["options"]
@@ -666,7 +666,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(post.kwargs["ephemeral"])
         self.assertTrue(post.kwargs["suppress_embeds"])
         self.assertEqual(post.kwargs["allowed_mentions"].to_dict()["parse"], [])
-        for phrase in ("**3 requests**", "**1 request**", "selected text", "store=False", "paid API account", "never downloads attachments", "20-message batch", "/scenario deepen"):
+        for phrase in ("**3 requests**", "**1 request**", "selected text", "store=False", "paid API account", "never downloads attachments", "20-message batch", "/scenario relevant", "/scenario deepen"):
             self.assertIn(phrase, text)
         self.assertLess(len(text), 2000)
         self.assertEqual(self.llm.calls, [])
@@ -709,6 +709,7 @@ class UtilityCommandTests(unittest.IsolatedAsyncioTestCase):
         help_text = self.interaction.response.send_message.call_args.args[0]
         self.assertIn("**/chesslab**", help_text)
         self.assertIn("**/synthesize**", help_text)
+        self.assertIn("**/scenario relevant**", help_text)
         self.assertIn("**/consent**", help_text)
         self.assertIn("**/memory", help_text)
         self.assertIn("**Message actions**", help_text)
