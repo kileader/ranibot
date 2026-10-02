@@ -12,7 +12,7 @@ class Settings:
     discord_token: str = field(repr=False)
     llm_api_key: str = field(repr=False)
     llm_provider: str = "openai"
-    llm_model: str = "gpt-5.6-luna"
+    llm_model: str = "gpt-6.1-sol"
     guild_id: int | None = None
     database_url: str | None = field(default=None, repr=False)
     llm_reasoning_effort: str | None = None
@@ -32,16 +32,21 @@ class Settings:
         provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
         if provider != "openai":
             raise ValueError("LLM_PROVIDER must be openai; v0 has no other adapter.")
-        model = os.getenv("LLM_MODEL", "gpt-5.6-luna").strip()
+        model = os.getenv("LLM_MODEL", "gpt-6.1-sol").strip()
         if not model:
             raise ValueError("LLM_MODEL must not be blank.")
         reasoning_text = os.getenv("LLM_REASONING_EFFORT")
         if reasoning_text is None:
-            reasoning_effort = "none" if model == "gpt-5.6-luna" else None
+            if model == "gpt-6.1-sol":
+                reasoning_effort = "low"
+            else:
+                reasoning_effort = "none" if model == "gpt-5.6-luna" else None
         else:
             reasoning_effort = reasoning_text.strip().lower() or None
         if reasoning_effort not in {None, "none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError("LLM_REASONING_EFFORT must be none, low, medium, high, xhigh, max, or blank.")
+        if model == "gpt-6.1-sol" and reasoning_effort == "none":
+            raise ValueError("gpt-6.1-sol does not support LLM_REASONING_EFFORT=none; use low or higher.")
         guild_text = os.getenv("DISCORD_GUILD_ID", "").strip()
         guild_id = None
         if guild_text:

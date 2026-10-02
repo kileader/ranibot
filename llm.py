@@ -24,7 +24,9 @@ class OpenAILLM:
             model=self.model,
             instructions=system_prompt,
             input=context,
-            max_output_tokens=400,
+            # This budget includes internal reasoning as well as visible text.
+            # Public response lengths are capped separately by the callers.
+            max_output_tokens=4096,
             store=False,
         )
         if self.reasoning_effort is not None:

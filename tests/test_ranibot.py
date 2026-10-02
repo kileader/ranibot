@@ -758,7 +758,21 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             await llm.generate("system", "context")
             request = sdk.return_value.responses.create.call_args.kwargs
             self.assertEqual(request["reasoning"], {"effort": "none"})
-            self.assertEqual(request["max_output_tokens"], 400)
+            self.assertEqual(request["max_output_tokens"], 4096)
+            await llm.close()
+
+    async def test_sol_has_room_for_reasoning_and_a_visible_reply(self):
+        with patch("llm.AsyncOpenAI") as sdk:
+            sdk.return_value.responses.create = AsyncMock(
+                return_value=SimpleNamespace(status="completed", output_text="Consider the evidence.")
+            )
+            sdk.return_value.close = AsyncMock()
+            llm = OpenAILLM("test-key", "gpt-6.1-sol", "low")
+            self.assertEqual(await llm.generate("system", "context"), "Consider the evidence.")
+            request = sdk.return_value.responses.create.call_args.kwargs
+            self.assertEqual(request["model"], "gpt-6.1-sol")
+            self.assertEqual(request["reasoning"], {"effort": "low"})
+            self.assertEqual(request["max_output_tokens"], 4096)
             await llm.close()
 
 
@@ -787,11 +801,16 @@ class ConfigurationAndOutputTests(unittest.TestCase):
             self.assertNotIn("private-token", repr(settings))
             self.assertNotIn("private-key", repr(settings))
             self.assertNotIn("private-database", repr(settings))
-            self.assertEqual(settings.llm_model, "gpt-5.6-luna")
-            self.assertEqual(settings.llm_reasoning_effort, "none")
+            self.assertEqual(settings.llm_model, "gpt-6.1-sol")
+            self.assertEqual(settings.llm_reasoning_effort, "low")
+            os.environ["LLM_REASONING_EFFORT"] = "none"
+            with self.assertRaisesRegex(ValueError, "gpt-6.1-sol.*none"):
+                Settings.from_env()
+            del os.environ["LLM_REASONING_EFFORT"]
             os.environ["LLM_MODEL"] = "gpt-4.1-mini"
             self.assertIsNone(Settings.from_env().llm_reasoning_effort)
             os.environ["LLM_MODEL"] = "gpt-5.6-luna"
+            self.assertEqual(Settings.from_env().llm_reasoning_effort, "none")
             os.environ["DISCORD_GUILD_ID"] = "bad-id"
             with self.assertRaisesRegex(ValueError, "DISCORD_GUILD_ID"):
                 Settings.from_env()
